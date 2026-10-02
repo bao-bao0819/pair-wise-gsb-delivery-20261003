@@ -21,16 +21,18 @@ go test -race ./...
 
 The whole pool lives in two files: `workerpool.go` (mechanics) and `options.go` (functional options). Understanding it requires seeing how three queues interact:
 
-- `taskQueue` (unbuffered chan): where `Submit`/`Do` hand tasks to the dispatcher.
-- `workerQueue` (unbuffered chan): where the dispatcher hands tasks to workers. Sending `nil` on it kills a worker.
-- `waitingQueue` (`deque.Deque`, owned solely by the dispatcher): overflow buffer when all `maxWorkers` workers are busy. Its length is mirrored into the atomic `waiting` counter so `WaitingQueueSize()` is lock-free.
+- `taskQueue` (unbuffered chan of `*queuedTask`): where `Submit`/`Do`/`SubmitHandle` hand tasks to the dispatcher.
+- `cancelQueue` (unbuffered chan of `cancelRequest`, reply channel buffered): how `TaskHandle.Cancel` asks the dispatcher to physically remove a waiting entry.
+- `workerReady` (buffered chan, cap `maxWorkers`, of per-worker task channels): an idle worker parks on its own `chan func()` and hands that channel to the dispatcher; the dispatcher sends the next task (or `nil` to reap the worker) through it. A token is present only while a worker is genuinely parked — never park a task send inside a `select` case expression, Go caches evaluated send operands across iterations and can redeliver a stale item.
+- `waitingQueue` (`deque.Deque[*queuedTask]`, owned solely by the dispatcher): overflow buffer when all `maxWorkers` workers are busy. Cancelable entries carry a `*taskEntry` (atomic state `waiting`/`running`/`done`/`canceled`); plain tasks have a nil entry. Its length is mirrored into the atomic `waiting` counter so `WaitingQueueSize()` is lock-free.
 
-A single dispatcher goroutine (`dispatch`), started by `New`, is the only goroutine that touches `waitingQueue` and the worker count. It creates workers lazily up to `maxWorkers`, and while the waiting queue is non-empty it routes all traffic through `processWaitingQueue` to preserve task order. When the pool is idle for a full idle timeout (default 2s, configurable or disabled via `WithIdleTimeout`), it reaps one idle worker per timeout period.
+A single dispatcher goroutine (`dispatch`), started by `New`, is the only goroutine that touches `waitingQueue` and the worker count. It creates workers lazily up to `maxWorkers`. If the waiting queue is non-empty, a ready-worker token is selected into the same `select` as `taskQueue`/`cancelQueue`; the dispatcher pops and claims (`entry.state -> running`) the front item only when handing it to a worker. `handleCancel` locates an entry by pointer (`deque.Index`) and `Remove`s it in place — never by wrapping the task in a no-op closure. On `Stop` (no wait) abandoned entries are transitioned to `canceled` without popping (tests inspect the deque after stop); on `StopWait`, `drainQueuedTasks` runs every item. A task's `run` sets `running`, calls the user function, nils its closure, then sets `done`.
 
 Non-obvious invariants to preserve when changing this code:
 
 - Task submission must never block, no matter how many tasks are queued.
 - `Do` detects a stopped pool by recovering from the panic caused by sending on the closed `taskQueue`; `Submit` panics on a stopped pool while `Do` returns `ErrStopped`.
+- `SubmitHandle` additionally prechecks `stopped` under `stopLock` and returns `ErrStopped`; each accepted task has exactly one terminal state (`done` or `canceled`), and `Cancel` returns nil / `ErrTaskCanceled` / `ErrTaskRunning` / `ErrTaskDone`.
 - `Stop` abandons queued tasks; `StopWait` drains them (`p.wait` flag read by the dispatcher after its loop exits). Both are safe to call multiple times via `stopOnce`, and both wait for `stoppedChan`.
 - `Pause` works by submitting `maxWorkers` blocking tasks that wait on the caller's Context or on `stopSignal`; `stopLock` orders Pause against Stop so a stop always unpauses workers before closing `taskQueue`.
 

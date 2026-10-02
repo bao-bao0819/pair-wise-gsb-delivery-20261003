@@ -47,6 +47,33 @@ func main() {
 
 [Example wrapper function](https://go.dev/play/p/BWnRhJYarZ1) to show start and finish time of submitted function.
 
+## Canceling a waiting task
+
+`SubmitHandle` works like `Submit`, but returns a `TaskHandle` whose `Cancel`
+method removes the task if it has not yet started. The queue stays unbounded,
+and canceling one task does not change the FIFO order of the others:
+
+```go
+handle, err := wp.SubmitHandle(func() {
+    // ... work ...
+})
+if err != nil {
+    // pool was stopped
+    log.Fatal(err)
+}
+
+switch err := handle.Cancel(); err {
+case nil:
+    fmt.Println("task was canceled before it started")
+case workerpool.ErrTaskCanceled:
+    fmt.Println("task was already canceled")
+case workerpool.ErrTaskRunning:
+    fmt.Println("task already started; it will run to completion")
+case workerpool.ErrTaskDone:
+    fmt.Println("task already finished")
+}
+```
+
 ## Usage Note
 
 There is no upper limit on the number of tasks queued, other than the limits of system resources. If the number of inbound tasks is too many to even queue for pending processing, then the solution is outside the scope of workerpool. It should be solved by distributing workload over multiple systems, and/or storing input for pending processing in intermediate storage such as a file system, distributed message queue, etc.
