@@ -57,6 +57,36 @@ of some key:
 
 For more usage examples please see [docs][godoc-url] or package tests.
 
+## Order preserving parameters view
+
+`ParseOptions` (and `Parameters.Set`) keeps every parameter occurrence, but
+does not distinguish a parameter without a value from an empty quoted one.
+Use `ParseOptionViews` when an upper layer protocol needs to inspect repeated
+parameters and their exact textual form:
+
+```go
+	options, ok := httphead.ParseOptionViews(
+		[]byte(`foo;a;b="";c="x;y";c=2`), nil,
+	)
+	// Each Parameter carries a ValueKind:
+	// httphead.ValueNone   – "a" has no value;
+	// httphead.ValueQuoted – "b" is an empty quoted string,
+	//                        "c" is a quoted string containing a semicolon;
+	// httphead.ValueToken  – "2" is an ordinary token.
+	// Occurrences are preserved in source order, so repeated "c" is visible.
+
+	// Explicit single value projection.
+	v, found, conflict := options[0].Parameters.Project("c", httphead.ProjectOptions{
+		Duplicates: httphead.DuplicateReject, // or DuplicateFirst / DuplicateLast.
+		FoldNames:  true,                     // case insensitive name comparison.
+	})
+```
+
+`WriteOptionViews` writes the view back preserving quoted values (a semicolon
+inside quotes never becomes a separator), and `OptionView.Clone` returns a deep
+copy that does not retain the input buffer. The legacy `ParseOptions` and
+`Parameters.Get` remain unchanged.
+
 [godoc-image]: https://godoc.org/github.com/gobwas/httphead?status.svg
 [godoc-url]: https://godoc.org/github.com/gobwas/httphead
 [travis-image]: https://travis-ci.org/gobwas/httphead.svg?branch=master
