@@ -155,6 +155,47 @@ if err != nil {
 
 If everything succeeds, the value in `parsedToken` will be equivalent to that in `token`.
 
+# One-time Tokens
+
+Paseto cannot make a token one-time by itself. For one-time links, provide a
+`ConsumptionStore` and use one of the `Parse...AndConsume` methods.
+
+```go
+type ConsumptionStore interface {
+	ConsumeJTI(jti string, expiresAt time.Time) (consumed bool, err error)
+}
+```
+
+The store must atomically insert the token's `jti`. It should return `true`
+when that insertion claims the `jti`, and `false` when the `jti` was already
+claimed. A non-nil error means the store could not be checked or updated.
+
+Consumption happens only after decryption or signature verification and after
+all configured rules pass. The token must also contain a non-empty `jti` and a
+valid, unexpired `exp`; invalid tokens never reach the store.
+
+```go
+token, err := parser.ParseV4PublicAndConsume(store, publicKey, signed, nil)
+if errors.Is(err, paseto.ErrJTIAlreadyConsumed) {
+	// the token has already been used
+} else {
+	var storeError paseto.ConsumptionStoreError
+	if errors.As(err, &storeError) {
+		// the store returned an error; reuse was not established
+	}
+	if err != nil {
+		// cryptographic, token format, rule, or required-claim error
+	}
+}
+```
+
+When the method returns successfully, consumption has already been committed.
+If the caller then fails to start or complete its business operation, the
+library cannot roll back the store or coordinate an external business
+transaction. Callers that need atomicity must include the business work in the
+same transactional boundary as the conditional `jti` insert; otherwise a retry
+will report that the token has already been consumed.
+
 # Supported Paseto Versions
 ## Version 4
 Version 4 is fully supported.

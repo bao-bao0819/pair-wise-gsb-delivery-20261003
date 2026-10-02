@@ -50,6 +50,18 @@ func (p Parser) ParseV2Local(key V2SymmetricKey, tainted string) (*Token, error)
 	return &t, nil
 }
 
+// ParseV2LocalAndConsume behaves like ParseV2Local and then atomically marks
+// the token's "jti" as used in store. The store is accessed only after
+// decryption and every parser rule succeeds.
+func (p Parser) ParseV2LocalAndConsume(store ConsumptionStore, key V2SymmetricKey, tainted string) (*Token, error) {
+	return p.parseAndConsume(func() result.Result[Token] {
+		msg := newMessage(V2Local, tainted)
+		return result.FlatMap(msg, func(m message) result.Result[Token] {
+			return m.v2Decrypt(key)
+		})
+	}, store)
+}
+
 // ParseV2Public will parse and verify a v2 public paseto and validate against
 // any parser rules. Error if parsing, verification, or any rule fails.
 func (p Parser) ParseV2Public(key V2AsymmetricPublicKey, tainted string) (*Token, error) {
@@ -65,6 +77,18 @@ func (p Parser) ParseV2Public(key V2AsymmetricPublicKey, tainted string) (*Token
 	}
 
 	return &t, nil
+}
+
+// ParseV2PublicAndConsume behaves like ParseV2Public and then atomically marks
+// the token's "jti" as used in store. The store is accessed only after
+// verification and every parser rule succeeds.
+func (p Parser) ParseV2PublicAndConsume(store ConsumptionStore, key V2AsymmetricPublicKey, tainted string) (*Token, error) {
+	return p.parseAndConsume(func() result.Result[Token] {
+		msg := newMessage(V2Public, tainted)
+		return result.FlatMap(msg, func(m message) result.Result[Token] {
+			return m.v2Verify(key)
+		})
+	}, store)
 }
 
 // ParseV3Local will parse and decrypt a v3 local paseto and validate against
@@ -84,6 +108,18 @@ func (p Parser) ParseV3Local(key V3SymmetricKey, tainted string, implicit []byte
 	return &t, nil
 }
 
+// ParseV3LocalAndConsume behaves like ParseV3Local and then atomically marks
+// the token's "jti" as used in store. The store is accessed only after
+// decryption and every parser rule succeeds.
+func (p Parser) ParseV3LocalAndConsume(store ConsumptionStore, key V3SymmetricKey, tainted string, implicit []byte) (*Token, error) {
+	return p.parseAndConsume(func() result.Result[Token] {
+		msg := newMessage(V3Local, tainted)
+		return result.FlatMap(msg, func(m message) result.Result[Token] {
+			return m.v3Decrypt(key, implicit)
+		})
+	}, store)
+}
+
 // ParseV3Public will parse and verify a v3 public paseto and validate against
 // any parser rules. Error if parsing, verification, or any rule fails.
 func (p Parser) ParseV3Public(key V3AsymmetricPublicKey, tainted string, implicit []byte) (*Token, error) {
@@ -99,6 +135,18 @@ func (p Parser) ParseV3Public(key V3AsymmetricPublicKey, tainted string, implici
 	}
 
 	return &t, nil
+}
+
+// ParseV3PublicAndConsume behaves like ParseV3Public and then atomically marks
+// the token's "jti" as used in store. The store is accessed only after
+// verification and every parser rule succeeds.
+func (p Parser) ParseV3PublicAndConsume(store ConsumptionStore, key V3AsymmetricPublicKey, tainted string, implicit []byte) (*Token, error) {
+	return p.parseAndConsume(func() result.Result[Token] {
+		msg := newMessage(V3Public, tainted)
+		return result.FlatMap(msg, func(m message) result.Result[Token] {
+			return m.v3Verify(key, implicit)
+		})
+	}, store)
 }
 
 // ParseV4Local will parse and decrypt a v4 local paseto and validate against
@@ -118,6 +166,18 @@ func (p Parser) ParseV4Local(key V4SymmetricKey, tainted string, implicit []byte
 	return &t, nil
 }
 
+// ParseV4LocalAndConsume behaves like ParseV4Local and then atomically marks
+// the token's "jti" as used in store. The store is accessed only after
+// decryption and every parser rule succeeds.
+func (p Parser) ParseV4LocalAndConsume(store ConsumptionStore, key V4SymmetricKey, tainted string, implicit []byte) (*Token, error) {
+	return p.parseAndConsume(func() result.Result[Token] {
+		msg := newMessage(V4Local, tainted)
+		return result.FlatMap(msg, func(m message) result.Result[Token] {
+			return m.v4Decrypt(key, implicit)
+		})
+	}, store)
+}
+
 // ParseV4Public will parse and verify a v4 public paseto and validate against
 // any parser rules. Error if parsing, verification, or any rule fails.
 func (p Parser) ParseV4Public(key V4AsymmetricPublicKey, tainted string, implicit []byte) (*Token, error) {
@@ -133,6 +193,18 @@ func (p Parser) ParseV4Public(key V4AsymmetricPublicKey, tainted string, implici
 	}
 
 	return &t, nil
+}
+
+// ParseV4PublicAndConsume behaves like ParseV4Public and then atomically marks
+// the token's "jti" as used in store. The store is accessed only after
+// verification and every parser rule succeeds.
+func (p Parser) ParseV4PublicAndConsume(store ConsumptionStore, key V4AsymmetricPublicKey, tainted string, implicit []byte) (*Token, error) {
+	return p.parseAndConsume(func() result.Result[Token] {
+		msg := newMessage(V4Public, tainted)
+		return result.FlatMap(msg, func(m message) result.Result[Token] {
+			return m.v4Verify(key, implicit)
+		})
+	}, store)
 }
 
 // UnsafeParseFooter returns the footer of a Paseto message. Beware that this
