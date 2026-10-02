@@ -11,6 +11,7 @@ Paseto is everything you love about JOSE (JWT, JWE, JWS) without any of the
   * [Key Differences between Paseto and JWT](#key-differences-between-paseto-and-jwt)
 * [Installation](#installation)
 * [Overview of the Go library](#overview-of-the-go-library)
+* [One-time Tokens (Replay Prevention)](#one-time-tokens-replay-prevention)
 * [Supported Paseto Versions](#supported-paseto-versions)
 
 # What is Paseto?
@@ -154,6 +155,59 @@ if err != nil {
 ```
 
 If everything succeeds, the value in `parsedToken` will be equivalent to that in `token`.
+
+# One-time Tokens (Replay Prevention)
+Paseto tokens are stateless and cannot prevent replay by themselves. To accept a
+token at most once, use a `ConsumingParser` together with a caller-provided
+`ConsumedTokenStore` keyed by the token's `jti` claim.
+
+```go
+// ConsumedTokenStore atomically marks a jti as used. Implementations provide
+// their own persistence, concurrency control, and retention policy.
+type ConsumedTokenStore interface {
+    // MarkConsumed records jti as consumed the first time it is seen and
+    // returns nil. For an already-consumed jti it returns an error wrapping
+    // ErrTokenAlreadyConsumed; any other failure is returned as a distinct
+    // error (surfaced as a StoreError).
+    MarkConsumed(jti string) error
+}
+```
+
+Consumption happens only after the token has been verified or decrypted **and**
+every configured rule has passed. The store is never written for malformed,
+unauthenticated, expired, or rule-rejected tokens, nor for tokens missing a
+`jti` or carrying a missing or invalid `exp` claim.
+
+```go
+parser := paseto.NewConsumingParser(store) // NotExpired is preloaded
+
+parsedToken, err := parser.ParseV4Public(publicKey, signed, nil)
+switch {
+case err == nil:
+    // first, accepted use: the jti was already marked consumed
+case errors.Is(err, paseto.ErrTokenAlreadyConsumed):
+    // replay: this jti was already consumed
+default:
+    var storeErr paseto.StoreError
+    if errors.As(err, &storeErr) {
+        // the store failed; the token was not confirmed consumed and may be
+        // retried
+    }
+}
+```
+
+Constructors mirror the ordinary parser: `NewConsumingParser`,
+`NewConsumingParserWithoutExpiryCheck`, `NewConsumingParserForValidNow`, and
+`MakeConsumingParser`. The ordinary `Parser` remains side-effect free and never
+touches a store.
+
+> **Note:** a successful return means the `jti` is already recorded as
+> consumed. The library cannot roll that marking back or join the caller's
+> external business transaction. If the business action is not performed
+> afterwards, retrying the same token reports `ErrTokenAlreadyConsumed`.
+> Callers needing atomicity between consumption and their own state change must
+> coordinate it themselves (for example by recording the consumed `jti` in the
+> same transaction as their business write).
 
 # Supported Paseto Versions
 ## Version 4

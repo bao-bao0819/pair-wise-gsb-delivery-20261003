@@ -40,14 +40,8 @@ func (p Parser) ParseV2Local(key V2SymmetricKey, tainted string) (*Token, error)
 	decrypted := result.FlatMap(msg, func(m message) result.Result[Token] {
 		return m.v2Decrypt(key)
 	})
-	token := result.FlatMap(decrypted, p.validate)
 
-	var t Token
-	if err := token.Ok(&t); err != nil {
-		return nil, err
-	}
-
-	return &t, nil
+	return p.parse(decrypted)
 }
 
 // ParseV2Public will parse and verify a v2 public paseto and validate against
@@ -57,14 +51,8 @@ func (p Parser) ParseV2Public(key V2AsymmetricPublicKey, tainted string) (*Token
 	decrypted := result.FlatMap(msg, func(m message) result.Result[Token] {
 		return m.v2Verify(key)
 	})
-	token := result.FlatMap(decrypted, p.validate)
 
-	var t Token
-	if err := token.Ok(&t); err != nil {
-		return nil, err
-	}
-
-	return &t, nil
+	return p.parse(decrypted)
 }
 
 // ParseV3Local will parse and decrypt a v3 local paseto and validate against
@@ -74,14 +62,8 @@ func (p Parser) ParseV3Local(key V3SymmetricKey, tainted string, implicit []byte
 	decrypted := result.FlatMap(msg, func(m message) result.Result[Token] {
 		return m.v3Decrypt(key, implicit)
 	})
-	token := result.FlatMap(decrypted, p.validate)
 
-	var t Token
-	if err := token.Ok(&t); err != nil {
-		return nil, err
-	}
-
-	return &t, nil
+	return p.parse(decrypted)
 }
 
 // ParseV3Public will parse and verify a v3 public paseto and validate against
@@ -91,14 +73,8 @@ func (p Parser) ParseV3Public(key V3AsymmetricPublicKey, tainted string, implici
 	decrypted := result.FlatMap(msg, func(m message) result.Result[Token] {
 		return m.v3Verify(key, implicit)
 	})
-	token := result.FlatMap(decrypted, p.validate)
 
-	var t Token
-	if err := token.Ok(&t); err != nil {
-		return nil, err
-	}
-
-	return &t, nil
+	return p.parse(decrypted)
 }
 
 // ParseV4Local will parse and decrypt a v4 local paseto and validate against
@@ -108,14 +84,8 @@ func (p Parser) ParseV4Local(key V4SymmetricKey, tainted string, implicit []byte
 	decrypted := result.FlatMap(msg, func(m message) result.Result[Token] {
 		return m.v4Decrypt(key, implicit)
 	})
-	token := result.FlatMap(decrypted, p.validate)
 
-	var t Token
-	if err := token.Ok(&t); err != nil {
-		return nil, err
-	}
-
-	return &t, nil
+	return p.parse(decrypted)
 }
 
 // ParseV4Public will parse and verify a v4 public paseto and validate against
@@ -125,14 +95,8 @@ func (p Parser) ParseV4Public(key V4AsymmetricPublicKey, tainted string, implici
 	decrypted := result.FlatMap(msg, func(m message) result.Result[Token] {
 		return m.v4Verify(key, implicit)
 	})
-	token := result.FlatMap(decrypted, p.validate)
 
-	var t Token
-	if err := token.Ok(&t); err != nil {
-		return nil, err
-	}
-
-	return &t, nil
+	return p.parse(decrypted)
 }
 
 // UnsafeParseFooter returns the footer of a Paseto message. Beware that this
@@ -168,4 +132,17 @@ func (p Parser) validate(token Token) result.Result[Token] {
 	}
 
 	return result.Ok(token)
+}
+
+// parse applies all configured rules to a cryptographically verified or
+// decrypted token. It performs no side effects beyond returning the token.
+func (p Parser) parse(verified result.Result[Token]) (*Token, error) {
+	token := result.FlatMap(verified, p.validate)
+
+	var t Token
+	if err := token.Ok(&t); err != nil {
+		return nil, err
+	}
+
+	return &t, nil
 }
