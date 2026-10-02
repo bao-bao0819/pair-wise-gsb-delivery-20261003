@@ -42,7 +42,7 @@ result, err := backoff.Retry(ctx, func() (string, error) {
 backoff until it succeeds, returns a `Permanent` error, or a limit is reached.
 See [example_test.go][example] for a fuller example, and the [package docs][godoc]
 for the available options (`WithBackOff`, `WithMaxTries`, `WithMaxElapsedTime`,
-`WithNotify`).
+`WithNotify`, `WithBudget`).
 
 If `Retry` does not fit your needs, copy it from [retry.go][retry-src] and adapt it.
 
@@ -59,6 +59,8 @@ case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 	// the caller's context was cancelled or its deadline expired
 case errors.Is(err, backoff.ErrMaxElapsedTime):
 	// the WithMaxElapsedTime budget was exhausted
+case errors.Is(err, backoff.ErrBudgetExhausted):
+	// the shared WithBudget allowance was spent
 case errors.Is(err, backoff.ErrExhausted):
 	// WithMaxTries was reached or the backoff policy returned Stop
 }

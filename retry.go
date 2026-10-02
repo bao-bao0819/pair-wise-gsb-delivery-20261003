@@ -27,6 +27,7 @@ type retryOptions struct {
 	Notify         Notify        // Optional function called before each backoff wait.
 	MaxTries       uint          // Maximum number of retry attempts.
 	MaxElapsedTime time.Duration // Maximum total time for all retries.
+	Budget         Budget        // Shared limit on the number of retry attempts.
 }
 
 // RetryOption configures the behavior of Retry.
@@ -97,14 +98,25 @@ func WithMaxElapsedTime(d time.Duration) RetryOption {
 	}
 }
 
+// WithBudget sets a budget shared with other Retry calls that limits how many
+// retry attempts this call may make. The first attempt is always free; only
+// retries reserve allowance. When the budget is spent, Retry stops with a
+// *RetryError whose Cause is ErrBudgetExhausted. See Budget for the exact
+// reservation semantics. The default, nil, means no budget.
+func WithBudget(b Budget) RetryOption {
+	return func(args *retryOptions) {
+		args.Budget = b
+	}
+}
+
 // Retry attempts the operation until it succeeds, returns a Permanent error,
 // or backoff completes. It ensures the operation is executed at least once.
 //
 // On success it returns the operation result and a nil error. On any failure
 // it returns the last result and a *RetryError whose Cause reports why it
-// stopped — ErrPermanent, ErrExhausted, ErrMaxElapsedTime, or the context
-// cancellation cause — and whose LastErr holds the last operation error.
-// See RetryError and AsRetryError.
+// stopped — ErrPermanent, ErrExhausted, ErrMaxElapsedTime, ErrBudgetExhausted,
+// or the context cancellation cause — and whose LastErr holds the last
+// operation error. See RetryError and AsRetryError.
 //
 // ctx bounds the retry loop: its cancellation or deadline stops further
 // attempts and interrupts the wait between them. The operation receives no
@@ -185,6 +197,12 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 			return res, &RetryError{LastErr: lastErr, Cause: ErrMaxElapsedTime}
 		}
 
+		// Reserve budget for the next attempt. This comes after every stop
+		// check, so a Retry that is about to stop never touches the budget.
+		if args.Budget != nil && !args.Budget.Acquire() {
+			return res, &RetryError{LastErr: lastErr, Cause: ErrBudgetExhausted}
+		}
+
 		// Notify on error if a notifier function is provided.
 		if args.Notify != nil {
 			args.Notify(err, next)
@@ -195,6 +213,11 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		select {
 		case <-args.Timer.C():
 		case <-ctx.Done():
+			// The wait was cancelled before the reserved attempt ran, so
+			// the reservation was never consumed: return it to the budget.
+			if args.Budget != nil {
+				args.Budget.Release()
+			}
 			return res, &RetryError{LastErr: lastErr, Cause: context.Cause(ctx)}
 		}
 	}
