@@ -10,4 +10,9 @@
 // and [MaxNestingDepth] package variables bound allocation and recursion. Prefer
 // [DecodePacketErr] over [DecodePacket], which reports failure only by returning
 // nil.
+//
+// For inputs that must be strict DER, [ValidateDER] and [DecodePacketDER]
+// enforce the DER restrictions (shortest-form tag/length encodings, canonical
+// BOOLEAN and INTEGER contents, no indefinite lengths) on the raw bytes for
+// the supported types, reporting the first violation's offset and path.
 package ber

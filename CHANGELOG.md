@@ -7,6 +7,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- `ValidateDER` and `DecodePacketDER`: an explicit strict-DER mode for the
+  supported types (BOOLEAN, INTEGER, NULL, OBJECT IDENTIFIER, the string
+  types, and SEQUENCE). Validation inspects the raw bytes -- shortest-form
+  tag/length encodings, INTEGER sign extension, canonical BOOLEAN values,
+  and no indefinite lengths -- and reports the first violation as a
+  `*DERError` with byte offset and value path. SET/SET OF and out-of-scope
+  types return an error wrapping `ErrUnsupportedStrictType`. The regular
+  BER decoder is unchanged.
 - `NewIntegerErr`, `NewRealErr`, `NewOIDErr`, and `NewRelativeOIDErr`:
   error-returning variants of the existing constructors that report invalid
   input instead of panicking or returning `nil`.
