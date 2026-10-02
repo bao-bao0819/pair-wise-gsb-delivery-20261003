@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -1478,4 +1479,233 @@ func expect(t *testing.T, a interface{}, b interface{}) {
 	if a != b {
 		t.Errorf("Expected [%v] (type %v) - Got [%v] (type %v)", b, reflect.TypeOf(b), a, reflect.TypeOf(a))
 	}
+}
+
+func TestEvaluateDoesNotWriteOrMutate(t *testing.T) {
+	t.Run("bad host", func(t *testing.T) {
+		s := New(Options{
+			AllowedHosts: []string{"good.example.com"},
+		})
+
+		badHostCalled := false
+		s.SetBadHostHandler(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			badHostCalled = true
+		}))
+
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://bad.example.com/foo", nil)
+
+		decision := s.Evaluate(req)
+
+		expect(t, decision.Action, ActionRejectBadHost)
+		expect(t, decision.Err.Error(), "bad host name: bad.example.com")
+		expect(t, badHostCalled, false)
+		expect(t, req.URL.String(), "http://bad.example.com/foo")
+	})
+
+	t.Run("bad request", func(t *testing.T) {
+		s := New(Options{
+			AllowRequestFunc: func(_ *http.Request) bool { return false },
+		})
+
+		badRequestCalled := false
+		s.SetBadRequestHandler(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			badRequestCalled = true
+		}))
+
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/foo", nil)
+
+		decision := s.Evaluate(req)
+
+		expect(t, decision.Action, ActionRejectBadRequest)
+		expect(t, decision.Err.Error(), "request not allowed")
+		expect(t, badRequestCalled, false)
+		expect(t, req.URL.String(), "http://example.com/foo")
+	})
+
+	t.Run("redirect", func(t *testing.T) {
+		s := New(Options{
+			SSLRedirect: true,
+		})
+
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/foo", nil)
+
+		decision := s.Evaluate(req)
+
+		expect(t, decision.Action, ActionRedirect)
+		expect(t, decision.Err.Error(), "redirecting to HTTPS")
+		expect(t, decision.RedirectURL, "https://example.com/foo")
+		expect(t, decision.RedirectStatus, http.StatusMovedPermanently)
+		expect(t, req.URL.String(), "http://example.com/foo")
+	})
+}
+
+//nolint:funlen
+func TestEvaluateMatchesRealResponse(t *testing.T) {
+	cases := []struct {
+		name       string
+		options    Options
+		newRequest func() *http.Request
+		expectCode int
+	}{
+		{
+			name: "allow with headers",
+			options: Options{
+				FrameDeny:          true,
+				ContentTypeNosniff: true,
+				BrowserXssFilter:   true,
+				ReferrerPolicy:     "same-origin",
+			},
+			newRequest: func() *http.Request {
+				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/foo", nil)
+
+				return req
+			},
+			expectCode: http.StatusOK,
+		},
+		{
+			name: "allow with sts over ssl",
+			options: Options{
+				STSSeconds:           315360000,
+				STSIncludeSubdomains: true,
+			},
+			newRequest: func() *http.Request {
+				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/foo", nil)
+
+				return req
+			},
+			expectCode: http.StatusOK,
+		},
+		{
+			name: "reject bad host",
+			options: Options{
+				AllowedHosts: []string{"good.example.com"},
+			},
+			newRequest: func() *http.Request {
+				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://bad.example.com/foo", nil)
+
+				return req
+			},
+			expectCode: http.StatusInternalServerError,
+		},
+		{
+			name: "reject bad request",
+			options: Options{
+				AllowRequestFunc: func(_ *http.Request) bool { return false },
+			},
+			newRequest: func() *http.Request {
+				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/foo", nil)
+
+				return req
+			},
+			expectCode: http.StatusBadRequest,
+		},
+		{
+			name: "redirect to https",
+			options: Options{
+				SSLRedirect: true,
+			},
+			newRequest: func() *http.Request {
+				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/foo", nil)
+
+				return req
+			},
+			expectCode: http.StatusMovedPermanently,
+		},
+		{
+			name: "temporary redirect to ssl host",
+			options: Options{
+				SSLRedirect:          true,
+				SSLTemporaryRedirect: true,
+				SSLHost:              "secure.example.com",
+			},
+			newRequest: func() *http.Request {
+				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/foo", nil)
+
+				return req
+			},
+			expectCode: http.StatusTemporaryRedirect,
+		},
+		{
+			name: "force ssl host",
+			options: Options{
+				SSLForceHost: true,
+				SSLHost:      "secure.example.com",
+			},
+			newRequest: func() *http.Request {
+				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/foo", nil)
+
+				return req
+			},
+			expectCode: http.StatusMovedPermanently,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := New(c.options)
+
+			evalReq := c.newRequest()
+			realReq := c.newRequest()
+
+			decision := s.Evaluate(evalReq)
+
+			res := httptest.NewRecorder()
+			s.Handler(myHandler).ServeHTTP(res, realReq)
+
+			expect(t, res.Code, c.expectCode)
+
+			switch decision.Action {
+			case ActionAllow:
+				expect(t, decision.Err, nil)
+				expect(t, res.Body.String(), "bar")
+
+				for key, values := range decision.Headers {
+					expect(t, len(values), 1)
+					expect(t, res.Header().Get(key), values[0])
+				}
+			case ActionRejectBadHost, ActionRejectBadRequest:
+				if decision.Err == nil {
+					t.Error("Expected a rejection reason, got nil")
+				}
+			case ActionRedirect:
+				if decision.Err == nil {
+					t.Error("Expected a redirect reason, got nil")
+				}
+
+				expect(t, res.Code, decision.RedirectStatus)
+				expect(t, res.Header().Get("Location"), decision.RedirectURL)
+			}
+		})
+	}
+}
+
+func TestEvaluateNonceGeneratedOnce(t *testing.T) {
+	s := New(Options{
+		ContentSecurityPolicy: "default-src 'self' $NONCE",
+	})
+
+	evalReq, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/foo", nil)
+
+	decision := s.Evaluate(evalReq)
+
+	expect(t, decision.Action, ActionAllow)
+
+	if decision.Nonce == "" {
+		t.Fatal("Expected a nonce in the decision, got an empty string")
+	}
+
+	// The generated nonce is stored in the decision, its headers, and its request context.
+	expect(t, CSPNonce(decision.Request.Context()), decision.Nonce)
+	expect(t, decision.Headers.Get(cspHeader), fmt.Sprintf("default-src 'self' 'nonce-%s'", decision.Nonce))
+
+	// The real response for the same request carries the same header shape with its own nonce.
+	realReq, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/foo", nil)
+
+	res := httptest.NewRecorder()
+	s.Handler(myHandler).ServeHTTP(res, realReq)
+
+	realCSP := res.Header().Get(cspHeader)
+	realNonce := strings.TrimSuffix(strings.Split(realCSP, "'nonce-")[1], "'")
+
+	expect(t, strings.ReplaceAll(realCSP, realNonce, decision.Nonce), decision.Headers.Get(cspHeader))
 }

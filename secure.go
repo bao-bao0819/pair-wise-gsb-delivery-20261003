@@ -298,12 +298,63 @@ func (s *Secure) ProcessNoModifyRequest(w http.ResponseWriter, r *http.Request) 
 	return s.processRequest(w, r)
 }
 
-// processRequest runs the actual checks on the request and returns an error if the middleware chain should stop.
-func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.Header, *http.Request, error) {
+// Action describes the outcome of evaluating a request against the configured Options.
+type Action int
+
+const (
+	// ActionAllow indicates the request should proceed down the middleware chain.
+	ActionAllow Action = iota
+	// ActionRejectBadHost indicates the request was rejected because its host is not allowed.
+	ActionRejectBadHost
+	// ActionRejectBadRequest indicates the request was rejected by the AllowRequestFunc.
+	ActionRejectBadRequest
+	// ActionRedirect indicates the request should be redirected to HTTPS.
+	ActionRedirect
+)
+
+// Decision is the pure result of evaluating a request against the configured Options.
+// It is produced by Evaluate and describes everything needed to apply the outcome
+// without re-running (or re-generating) any part of the evaluation.
+type Decision struct {
+	// Action is the outcome of the evaluation: allow, reject, or redirect.
+	Action Action
+
+	// Headers are the response headers to set when Action is ActionAllow.
+	Headers http.Header
+
+	// Err is the reason the request was not allowed. It is nil when Action is ActionAllow.
+	Err error
+
+	// RedirectURL is the target of the redirect. It is set when Action is ActionRedirect.
+	RedirectURL string
+
+	// RedirectStatus is the HTTP status code to use for the redirect. It is set when Action is ActionRedirect.
+	RedirectStatus int
+
+	// Nonce is the CSP nonce generated for this evaluation. It is empty when nonces are not enabled.
+	Nonce string
+
+	// Request is the request to continue with when Action is ActionAllow.
+	// It carries the CSP nonce in its context when nonces are enabled.
+	Request *http.Request
+}
+
+// Evaluate runs the actual checks on the request without touching any ResponseWriter.
+// It never invokes the bad host or bad request handlers, never writes a redirect,
+// and never modifies the URL of the passed request. The returned Decision describes
+// whether the request should be allowed, rejected, or redirected, along with the
+// headers to add and the reason for a rejection or redirect. When a CSP nonce is
+// required it is generated once and stored in the Decision, so applying the
+// Decision does not regenerate it.
+func (s *Secure) Evaluate(r *http.Request) Decision {
 	// Setup nonce if required.
+	nonce := ""
 	if s.opt.nonceEnabled {
-		r = withCSPNonce(r, cspRandNonce())
+		nonce = cspRandNonce()
+		r = withCSPNonce(r, nonce)
 	}
+
+	decision := Decision{Action: ActionAllow, Nonce: nonce, Request: r}
 
 	// Resolve the host for the request, using proxy headers if present.
 	host := r.Host
@@ -339,9 +390,10 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 		}
 
 		if !isGoodHost {
-			s.badHostHandler.ServeHTTP(w, r)
+			decision.Action = ActionRejectBadHost
+			decision.Err = fmt.Errorf("bad host name: %s", host)
 
-			return nil, nil, fmt.Errorf("bad host name: %s", host)
+			return decision
 		}
 	}
 
@@ -350,7 +402,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 
 	// SSL check.
 	if s.opt.SSLRedirect && !ssl && !s.opt.IsDevelopment {
-		url := r.URL
+		url := *r.URL
 		url.Scheme = "https"
 		url.Host = host
 
@@ -367,9 +419,12 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 			status = http.StatusTemporaryRedirect
 		}
 
-		http.Redirect(w, r, url.String(), status)
+		decision.Action = ActionRedirect
+		decision.RedirectURL = url.String()
+		decision.RedirectStatus = status
+		decision.Err = fmt.Errorf("redirecting to HTTPS")
 
-		return nil, nil, fmt.Errorf("redirecting to HTTPS")
+		return decision
 	}
 
 	if s.opt.SSLForceHost {
@@ -384,7 +439,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 		}
 
 		if tempSSLHost != host {
-			url := r.URL
+			url := *r.URL
 			url.Scheme = "https"
 			url.Host = tempSSLHost
 
@@ -393,19 +448,53 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 				status = http.StatusTemporaryRedirect
 			}
 
-			http.Redirect(w, r, url.String(), status)
+			decision.Action = ActionRedirect
+			decision.RedirectURL = url.String()
+			decision.RedirectStatus = status
+			decision.Err = fmt.Errorf("redirecting to HTTPS")
 
-			return nil, nil, fmt.Errorf("redirecting to HTTPS")
+			return decision
 		}
 	}
 
 	// If the AllowRequestFunc is set, call it and exit early if needed.
 	if s.opt.AllowRequestFunc != nil && !s.opt.AllowRequestFunc(r) {
-		s.badRequestHandler.ServeHTTP(w, r)
+		decision.Action = ActionRejectBadRequest
+		decision.Err = fmt.Errorf("request not allowed")
 
-		return nil, nil, fmt.Errorf("request not allowed")
+		return decision
 	}
 
+	decision.Headers = s.responseHeaders(r, ssl)
+
+	return decision
+}
+
+// processRequest runs the actual checks on the request and returns an error if the middleware chain should stop.
+func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.Header, *http.Request, error) {
+	decision := s.Evaluate(r)
+
+	switch decision.Action {
+	case ActionRejectBadHost:
+		s.badHostHandler.ServeHTTP(w, decision.Request)
+
+		return nil, nil, decision.Err
+	case ActionRejectBadRequest:
+		s.badRequestHandler.ServeHTTP(w, decision.Request)
+
+		return nil, nil, decision.Err
+	case ActionRedirect:
+		http.Redirect(w, decision.Request, decision.RedirectURL, decision.RedirectStatus)
+
+		return nil, nil, decision.Err
+	}
+
+	return decision.Headers, decision.Request, nil
+}
+
+// responseHeaders builds the security headers for an allowed request.
+// The ssl argument indicates whether the request is considered to be on HTTPS.
+func (s *Secure) responseHeaders(r *http.Request, ssl bool) http.Header {
 	// Create our header container.
 	responseHeader := make(http.Header)
 
@@ -504,7 +593,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 		responseHeader.Set(permittedCrossDomainPolicies, s.opt.XPermittedCrossDomainPolicies)
 	}
 
-	return responseHeader, r, nil
+	return responseHeader
 }
 
 // isSSL determine if we are on HTTPS.
