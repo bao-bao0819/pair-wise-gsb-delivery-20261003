@@ -46,6 +46,14 @@ var (
 	// ErrFreePagesNotLoaded is returned when a readonly transaction without
 	// preloading the free pages is trying to access the free pages.
 	ErrFreePagesNotLoaded = errors.New("free pages are not pre-loaded")
+
+	// ErrSavepointNotFound is returned when rolling back to or releasing a
+	// savepoint that does not exist in the current transaction.
+	ErrSavepointNotFound = errors.New("savepoint not found")
+
+	// ErrStaleHandle is returned when using a Bucket or Cursor handle that
+	// has been invalidated by a savepoint rollback.
+	ErrStaleHandle = errors.New("stale handle: invalidated by savepoint rollback")
 )
 
 // These errors can occur when putting or deleting a value or a bucket.

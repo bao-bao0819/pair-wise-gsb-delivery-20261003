@@ -47,6 +47,61 @@ func TestFreelist_free_double_free_panics(t *testing.T) {
 	})
 }
 
+// Ensure that rolling back to a savepoint undoes the frees and allocations
+// performed by the transaction after the savepoint was taken.
+func TestFreelist_savepoint_rollback(t *testing.T) {
+	f := newTestFreelist()
+	f.Init([]common.Pgid{12, 13, 14, 15, 16, 17})
+
+	// Allocate and free some pages before the savepoint.
+	require.Equal(t, common.Pgid(12), f.Allocate(100, 2)) // allocates 12,13
+	f.Free(100, common.NewPage(30, 0, 0, 1))              // pending: 30,31
+
+	sp := f.Savepoint(100)
+
+	// Allocate and free more pages after the savepoint.
+	require.Equal(t, common.Pgid(14), f.Allocate(100, 2)) // allocates 14,15
+	f.Free(100, common.NewPage(40, 0, 0, 0))              // pending: 30,31,40
+	require.Equal(t, 2, f.FreeCount())
+	require.Equal(t, 3, f.PendingCount())
+
+	f.RollbackToSavepoint(100, sp)
+
+	// Pages allocated after the savepoint are free again.
+	require.True(t, f.Freed(14))
+	require.True(t, f.Freed(15))
+	// Pages freed after the savepoint are no longer free.
+	require.False(t, f.Freed(40))
+	// State captured by the savepoint is retained.
+	require.False(t, f.Freed(12))
+	require.False(t, f.Freed(13))
+	require.True(t, f.Freed(30))
+	require.True(t, f.Freed(31))
+	require.Equal(t, 4, f.FreeCount())
+	require.Equal(t, 2, f.PendingCount())
+
+	// The returned pages can be allocated again.
+	require.Equal(t, common.Pgid(14), f.Allocate(100, 2))
+}
+
+// Ensure that rolling back to a savepoint taken before any pending free
+// removes the pending list entirely.
+func TestFreelist_savepoint_rollback_no_pending(t *testing.T) {
+	f := newTestFreelist()
+	f.Init([]common.Pgid{5, 6, 7})
+
+	sp := f.Savepoint(100)
+
+	f.Free(100, common.NewPage(50, 0, 0, 0))
+	require.Equal(t, 1, f.PendingCount())
+
+	f.RollbackToSavepoint(100, sp)
+
+	require.Equal(t, 0, f.PendingCount())
+	require.False(t, f.Freed(50))
+	require.Equal(t, 3, f.FreeCount())
+}
+
 // Ensure that attempting to free the meta page panics
 func TestFreelist_free_meta_panics(t *testing.T) {
 	f := newTestFreelist()

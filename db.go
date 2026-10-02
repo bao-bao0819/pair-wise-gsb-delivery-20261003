@@ -503,6 +503,7 @@ func (db *DB) mmap(minsz int) (err error) {
 	// Dereference all mmap references before unmapping.
 	if db.rwtx != nil {
 		db.rwtx.root.dereference()
+		db.rwtx.dereferenceSavepoints()
 	}
 
 	// Unmap existing data before continuing.

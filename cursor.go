@@ -21,7 +21,17 @@ import (
 // after mutating data.
 type Cursor struct {
 	bucket *Bucket
+	gen    uint64 // the tx generation at cursor creation; see Tx.generation
 	stack  []elemRef
+}
+
+// assertValid panics if the cursor can no longer be used, either because
+// the transaction is closed or because the cursor was invalidated by a
+// savepoint rollback.
+func (c *Cursor) assertValid() {
+	common.Assert(c.bucket.tx.db != nil, "tx closed")
+	common.Assert(c.gen == c.bucket.tx.generation && !c.bucket.stale(),
+		"cursor invalidated by savepoint rollback")
 }
 
 // Bucket returns the bucket that this cursor was created from.
@@ -33,7 +43,7 @@ func (c *Cursor) Bucket() *Bucket {
 // If the bucket is empty then a nil key and value are returned.
 // The returned key and value are only valid for the life of the transaction.
 func (c *Cursor) First() (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+	c.assertValid()
 	k, v, flags := c.first()
 	if (flags & uint32(common.BucketLeafFlag)) != 0 {
 		return k, nil
@@ -64,7 +74,7 @@ func (c *Cursor) first() (key []byte, value []byte, flags uint32) {
 // If the bucket is empty then a nil key and value are returned.
 // The returned key and value are only valid for the life of the transaction.
 func (c *Cursor) Last() (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+	c.assertValid()
 	c.stack = c.stack[:0]
 	p, n := c.bucket.pageNode(c.bucket.RootPage())
 	ref := elemRef{page: p, node: n}
@@ -93,7 +103,7 @@ func (c *Cursor) Last() (key []byte, value []byte) {
 // If the cursor is at the end of the bucket then a nil key and value are returned.
 // The returned key and value are only valid for the life of the transaction.
 func (c *Cursor) Next() (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+	c.assertValid()
 	k, v, flags := c.next()
 	if (flags & uint32(common.BucketLeafFlag)) != 0 {
 		return k, nil
@@ -105,7 +115,7 @@ func (c *Cursor) Next() (key []byte, value []byte) {
 // If the cursor is at the beginning of the bucket then a nil key and value are returned.
 // The returned key and value are only valid for the life of the transaction.
 func (c *Cursor) Prev() (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+	c.assertValid()
 	k, v, flags := c.prev()
 	if (flags & uint32(common.BucketLeafFlag)) != 0 {
 		return k, nil
@@ -118,7 +128,7 @@ func (c *Cursor) Prev() (key []byte, value []byte) {
 // follow, a nil key is returned.
 // The returned key and value are only valid for the life of the transaction.
 func (c *Cursor) Seek(seek []byte) (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+	c.assertValid()
 
 	k, v, flags := c.seek(seek)
 
@@ -140,6 +150,8 @@ func (c *Cursor) Seek(seek []byte) (key []byte, value []byte) {
 func (c *Cursor) Delete() error {
 	if c.bucket.tx.db == nil {
 		return errors.ErrTxClosed
+	} else if c.gen != c.bucket.tx.generation || c.bucket.stale() {
+		return errors.ErrStaleHandle
 	} else if !c.bucket.Writable() {
 		return errors.ErrTxNotWritable
 	}

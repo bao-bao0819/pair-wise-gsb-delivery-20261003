@@ -50,6 +50,7 @@ New minor versions may add additional features to the API.
       - [Read-only transactions](#read-only-transactions)
       - [Batch read-write transactions](#batch-read-write-transactions)
       - [Managing transactions manually](#managing-transactions-manually)
+      - [Savepoints](#savepoints)
     - [Using buckets](#using-buckets)
     - [Using key/value pairs](#using-keyvalue-pairs)
     - [Autoincrementing integer for the bucket](#autoincrementing-integer-for-the-bucket)
@@ -279,6 +280,44 @@ if err := tx.Commit(); err != nil {
 
 The first argument to `DB.Begin()` is a boolean stating if the transaction
 should be writable.
+
+#### Savepoints
+
+A writable transaction can create named savepoints to mark intermediate
+states. If a later step of the transaction fails, you can roll back to a
+savepoint instead of aborting the whole transaction:
+
+```go
+err := db.Update(func(tx *bolt.Tx) error {
+	b, _ := tx.CreateBucketIfNotExists([]byte("MyBucket"))
+	if err := b.Put([]byte("step1"), []byte("done")); err != nil {
+		return err
+	}
+
+	if err := tx.Savepoint("after-step1"); err != nil {
+		return err
+	}
+
+	if err := b.Put([]byte("step2"), []byte("done")); err != nil {
+		// Undo everything since the savepoint and keep going.
+		if rerr := tx.RollbackToSavepoint("after-step1"); rerr != nil {
+			return rerr
+		}
+	}
+	return nil
+})
+```
+
+Savepoints are stacked: `Tx.RollbackToSavepoint()` restores the state
+captured by the named savepoint and destroys all savepoints created after
+it, while the named savepoint itself stays active. `Tx.ReleaseSavepoint()`
+destroys the named savepoint and all savepoints created after it. A
+savepoint is not a nested transaction; changes are only persisted when the
+enclosing transaction commits.
+
+Note that all `Bucket` and `Cursor` handles obtained before a rollback are
+invalidated by `Tx.RollbackToSavepoint()` and must be re-acquired from the
+transaction.
 
 
 ### Using buckets

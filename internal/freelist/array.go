@@ -52,6 +52,7 @@ func (f *array) Allocate(txid common.Txid, n int) common.Pgid {
 				delete(f.cache, initial+i)
 			}
 			f.allocs[initial] = txid
+			f.allocSpans[initial] = uint64(n)
 			return initial
 		}
 

@@ -34,6 +34,16 @@ type Tx struct {
 	stats          TxStats
 	commitHandlers []func()
 
+	// savepoints holds the named savepoints created within this
+	// transaction, in creation order. Only used by writable transactions.
+	savepoints []*savepoint
+
+	// generation is incremented on every RollbackToSavepoint call. Bucket
+	// and Cursor handles record the generation at creation time; a handle
+	// whose generation does not match the transaction's current generation
+	// is stale and must not be used.
+	generation uint64
+
 	// WriteFlag specifies the flag for write-related methods like WriteTo().
 	// Tx opens the database file with the specified flag to copy the data.
 	//
@@ -375,6 +385,7 @@ func (tx *Tx) close() {
 	tx.meta = nil
 	tx.root = Bucket{tx: tx}
 	tx.pages = nil
+	tx.savepoints = nil
 }
 
 // Copy writes the entire database to a writer.

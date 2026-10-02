@@ -16,6 +16,17 @@ type ReadWriter interface {
 	EstimatedWritePageSize() int
 }
 
+// TxSavepoint captures the parts of the freelist state that are mutated by
+// a writable transaction, so that they can be restored later via
+// RollbackToSavepoint. It is only meaningful for the transaction that
+// created it and must not be reused across transactions.
+type TxSavepoint struct {
+	hasPending    bool
+	pendingIds    []common.Pgid
+	pendingAllocs []common.Txid
+	allocSpans    map[common.Pgid]uint64
+}
+
 type Interface interface {
 	ReadWriter
 
@@ -54,6 +65,17 @@ type Interface interface {
 
 	// Rollback removes the pages from a given pending tx.
 	Rollback(txId common.Txid)
+
+	// Savepoint captures the current freelist state associated with the
+	// given writable transaction id, so it can be restored later by
+	// RollbackToSavepoint.
+	Savepoint(txid common.Txid) TxSavepoint
+
+	// RollbackToSavepoint restores the freelist state captured by the
+	// given savepoint: pages freed by the transaction after the savepoint
+	// are un-freed, and pages allocated by the transaction after the
+	// savepoint are returned to the free list.
+	RollbackToSavepoint(txid common.Txid, sp TxSavepoint)
 
 	// Copyall copies a list of all free ids and all pending ids in one sorted list.
 	// f.count returns the minimum length required for dst.

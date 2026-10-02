@@ -3,6 +3,7 @@ package freelist
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"unsafe"
 
@@ -20,15 +21,17 @@ type shared struct {
 
 	readonlyTXIDs []common.Txid               // all readonly transaction IDs.
 	allocs        map[common.Pgid]common.Txid // mapping of Txid that allocated a pgid.
+	allocSpans    map[common.Pgid]uint64      // mapping of allocated span start pgid to its size in pages.
 	cache         map[common.Pgid]struct{}    // fast lookup of all free and pending page ids.
 	pending       map[common.Txid]*txPending  // mapping of soon-to-be free page ids by tx.
 }
 
 func newShared() *shared {
 	return &shared{
-		pending: make(map[common.Txid]*txPending),
-		allocs:  make(map[common.Pgid]common.Txid),
-		cache:   make(map[common.Pgid]struct{}),
+		pending:    make(map[common.Txid]*txPending),
+		allocs:     make(map[common.Pgid]common.Txid),
+		allocSpans: make(map[common.Pgid]uint64),
+		cache:      make(map[common.Pgid]struct{}),
 	}
 }
 
@@ -72,6 +75,7 @@ func (t *shared) Free(txid common.Txid, p *common.Page) {
 	})
 	if ok {
 		delete(t.allocs, p.Id())
+		delete(t.allocSpans, p.Id())
 	}
 
 	for id := p.Id(); id <= p.Id()+common.Pgid(p.Overflow()); id++ {
@@ -113,8 +117,85 @@ func (t *shared) Rollback(txid common.Txid) {
 	for pgid, tid := range t.allocs {
 		if tid == txid {
 			delete(t.allocs, pgid)
+			delete(t.allocSpans, pgid)
 		}
 	}
+}
+
+// Savepoint implements Interface.Savepoint.
+func (t *shared) Savepoint(txid common.Txid) TxSavepoint {
+	sp := TxSavepoint{}
+	if txp := t.pending[txid]; txp != nil {
+		sp.hasPending = true
+		sp.pendingIds = slices.Clone(txp.ids)
+		sp.pendingAllocs = slices.Clone(txp.alloctx)
+	}
+	for start, atxid := range t.allocs {
+		if atxid != txid {
+			continue
+		}
+		if sp.allocSpans == nil {
+			sp.allocSpans = make(map[common.Pgid]uint64)
+		}
+		sp.allocSpans[start] = t.allocSpans[start]
+	}
+	return sp
+}
+
+// RollbackToSavepoint implements Interface.RollbackToSavepoint.
+func (t *shared) RollbackToSavepoint(txid common.Txid, sp TxSavepoint) {
+	// Undo the pages freed by the transaction after the savepoint was taken.
+	// The pending list of a writable transaction only ever grows while the
+	// transaction is open, so the savepoint's list is always a prefix of
+	// the current one.
+	if txp := t.pending[txid]; txp != nil {
+		common.Verify(func() {
+			if len(txp.ids) < len(sp.pendingIds) {
+				panic(fmt.Sprintf("savepoint pending list (%d) longer than current pending list (%d)", len(sp.pendingIds), len(txp.ids)))
+			}
+			for i, id := range sp.pendingIds {
+				if txp.ids[i] != id {
+					panic(fmt.Sprintf("savepoint pending list is not a prefix of the current pending list at index %d", i))
+				}
+			}
+		})
+		for i := len(sp.pendingIds); i < len(txp.ids); i++ {
+			pgid := txp.ids[i]
+			delete(t.cache, pgid)
+			if atx := txp.alloctx[i]; atx != 0 {
+				// The page was allocated by an older transaction and its
+				// allocation record was removed when it was freed; restore it.
+				t.allocs[pgid] = atx
+			}
+		}
+		if sp.hasPending {
+			txp.ids = slices.Clone(sp.pendingIds)
+			txp.alloctx = slices.Clone(sp.pendingAllocs)
+		} else {
+			delete(t.pending, txid)
+		}
+	}
+
+	// Undo the pages allocated by the transaction after the savepoint was
+	// taken by returning them to the free list.
+	var released []common.Pgid
+	for start, atxid := range t.allocs {
+		if atxid != txid {
+			continue
+		}
+		if _, ok := sp.allocSpans[start]; ok {
+			continue
+		}
+		size := t.allocSpans[start]
+		delete(t.allocs, start)
+		delete(t.allocSpans, start)
+		for i := common.Pgid(0); i < common.Pgid(size); i++ {
+			id := start + i
+			t.cache[id] = struct{}{}
+			released = append(released, id)
+		}
+	}
+	t.mergeSpans(released)
 }
 
 func (t *shared) AddReadonlyTXID(tid common.Txid) {
