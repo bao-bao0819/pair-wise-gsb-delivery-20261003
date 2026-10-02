@@ -32,6 +32,36 @@ func newShared() *shared {
 	}
 }
 
+// cloneShared returns a deep copy of the shared freelist state.
+// The Interface field is left unset; the caller is responsible for
+// pointing it at the new outer concrete implementation.
+func (t *shared) cloneShared() *shared {
+	c := &shared{
+		readonlyTXIDs: make([]common.Txid, len(t.readonlyTXIDs)),
+		allocs:        make(map[common.Pgid]common.Txid, len(t.allocs)),
+		cache:         make(map[common.Pgid]struct{}, len(t.cache)),
+		pending:       make(map[common.Txid]*txPending, len(t.pending)),
+	}
+	copy(c.readonlyTXIDs, t.readonlyTXIDs)
+	for pgid, txid := range t.allocs {
+		c.allocs[pgid] = txid
+	}
+	for pgid := range t.cache {
+		c.cache[pgid] = struct{}{}
+	}
+	for txid, txp := range t.pending {
+		ntxp := &txPending{
+			ids:              make([]common.Pgid, len(txp.ids)),
+			alloctx:          make([]common.Txid, len(txp.alloctx)),
+			lastReleaseBegin: txp.lastReleaseBegin,
+		}
+		copy(ntxp.ids, txp.ids)
+		copy(ntxp.alloctx, txp.alloctx)
+		c.pending[txid] = ntxp
+	}
+	return c
+}
+
 func (t *shared) pendingPageIds() map[common.Txid]*txPending {
 	return t.pending
 }

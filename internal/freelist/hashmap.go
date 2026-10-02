@@ -141,6 +141,56 @@ func (f *hashMap) freePageIds() common.Pgids {
 	return m
 }
 
+func (f *hashMap) clone() *hashMap {
+	c := &hashMap{
+		shared:         f.shared.cloneShared(),
+		freePagesCount: f.freePagesCount,
+		freemaps:       make(map[uint64]pidSet, len(f.freemaps)),
+		forwardMap:     make(map[common.Pgid]uint64, len(f.forwardMap)),
+		backwardMap:    make(map[common.Pgid]uint64, len(f.backwardMap)),
+	}
+	for size, idSet := range f.freemaps {
+		newSet := make(pidSet, len(idSet))
+		for start := range idSet {
+			newSet[start] = struct{}{}
+		}
+		c.freemaps[size] = newSet
+	}
+	for start, size := range f.forwardMap {
+		c.forwardMap[start] = size
+	}
+	for end, size := range f.backwardMap {
+		c.backwardMap[end] = size
+	}
+	c.Interface = c
+	return c
+}
+
+// Clone returns a deep copy of the freelist.
+func (f *hashMap) Clone() Interface {
+	return f.clone()
+}
+
+// Reset replaces the current state of the freelist with a deep copy of
+// the given freelist's state.
+func (f *hashMap) Reset(other Interface) {
+	o, ok := other.(*hashMap)
+	if !ok {
+		panic(fmt.Sprintf("cannot reset a hashmap freelist from a different freelist type: %T", other))
+	}
+	c := o.clone()
+	// Preserve the live readonly transaction list: read transactions
+	// register and unregister independently of the writer, so the
+	// snapshot's list may be stale.
+	c.shared.readonlyTXIDs = f.shared.readonlyTXIDs
+	f.shared = c.shared
+	f.freePagesCount = c.freePagesCount
+	f.freemaps = c.freemaps
+	f.forwardMap = c.forwardMap
+	f.backwardMap = c.backwardMap
+	f.Interface = f
+}
+
 func (f *hashMap) hashmapFreeCountSlow() int {
 	count := 0
 	for _, size := range f.forwardMap {

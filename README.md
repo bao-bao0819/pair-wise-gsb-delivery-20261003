@@ -50,6 +50,7 @@ New minor versions may add additional features to the API.
       - [Read-only transactions](#read-only-transactions)
       - [Batch read-write transactions](#batch-read-write-transactions)
       - [Managing transactions manually](#managing-transactions-manually)
+      - [Savepoints](#savepoints)
     - [Using buckets](#using-buckets)
     - [Using key/value pairs](#using-keyvalue-pairs)
     - [Autoincrementing integer for the bucket](#autoincrementing-integer-for-the-bucket)
@@ -279,6 +280,56 @@ if err := tx.Commit(); err != nil {
 
 The first argument to `DB.Begin()` is a boolean stating if the transaction
 should be writable.
+
+#### Savepoints
+
+A writable transaction can create named savepoints to partially roll back its
+changes. If one step of a multi-step update fails, you can roll back to a
+savepoint instead of aborting the whole transaction:
+
+```go
+tx, err := db.Begin(true)
+if err != nil {
+    return err
+}
+defer tx.Rollback()
+
+b, err := tx.CreateBucketIfNotExists([]byte("MyBucket"))
+if err != nil {
+    return err
+}
+if err := b.Put([]byte("step1"), []byte("done")); err != nil {
+    return err
+}
+
+if err := tx.Savepoint("after-step1"); err != nil {
+    return err
+}
+if err := b.Put([]byte("step2"), []byte("done")); err != nil {
+    // Undo everything since the savepoint and keep going.
+    if rerr := tx.RollbackToSavepoint("after-step1"); rerr != nil {
+        return rerr
+    }
+    // Handles acquired before the rollback are invalid; re-acquire them.
+    b = tx.Bucket([]byte("MyBucket"))
+}
+
+if err := tx.Commit(); err != nil {
+    return err
+}
+```
+
+Savepoints can be nested: `Tx.RollbackToSavepoint()` keeps the named savepoint
+active but discards all savepoints created after it, and `Tx.ReleaseSavepoint()`
+discards the named savepoint and all savepoints created after it without
+undoing any change. A savepoint is not an independent transaction; only
+`Tx.Commit()` persists the changes.
+
+Note that rolling back to a savepoint invalidates all `Bucket` and `Cursor`
+handles obtained before the rollback, because they may reference pages that
+were rolled back or reallocated. Methods returning an error will return
+`ErrSavepointRolledBack` and other methods will panic; re-acquire the handles
+from the transaction after the rollback.
 
 
 ### Using buckets

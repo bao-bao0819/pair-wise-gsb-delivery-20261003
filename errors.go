@@ -64,6 +64,24 @@ var (
 	//
 	// Deprecated: Use the error variables defined in the bbolt/errors package.
 	ErrFreePagesNotLoaded = errors.ErrFreePagesNotLoaded
+
+	// ErrSavepointExists is returned when creating a savepoint with a name
+	// that is already used by another active savepoint in the transaction.
+	//
+	// Deprecated: Use the error variables defined in the bbolt/errors package.
+	ErrSavepointExists = errors.ErrSavepointExists
+
+	// ErrSavepointNotFound is returned when rolling back to or releasing a
+	// savepoint that does not exist in the transaction.
+	//
+	// Deprecated: Use the error variables defined in the bbolt/errors package.
+	ErrSavepointNotFound = errors.ErrSavepointNotFound
+
+	// ErrSavepointRolledBack is returned when using a bucket or cursor handle
+	// that has been invalidated by a savepoint rollback.
+	//
+	// Deprecated: Use the error variables defined in the bbolt/errors package.
+	ErrSavepointRolledBack = errors.ErrSavepointRolledBack
 )
 
 // These errors can occur when putting or deleting a value or a bucket.

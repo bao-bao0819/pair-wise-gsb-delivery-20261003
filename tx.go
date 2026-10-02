@@ -33,6 +33,12 @@ type Tx struct {
 	pages          map[common.Pgid]*common.Page
 	stats          TxStats
 	commitHandlers []func()
+	savepoints     []*savepoint
+
+	// epoch is incremented every time the transaction is rolled back to a
+	// savepoint. Bucket and Cursor handles created before the rollback carry
+	// a stale epoch and are therefore invalidated.
+	epoch uint64
 
 	// WriteFlag specifies the flag for write-related methods like WriteTo().
 	// Tx opens the database file with the specified flag to copy the data.
@@ -375,6 +381,7 @@ func (tx *Tx) close() {
 	tx.meta = nil
 	tx.root = Bucket{tx: tx}
 	tx.pages = nil
+	tx.savepoints = nil
 }
 
 // Copy writes the entire database to a writer.

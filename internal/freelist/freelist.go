@@ -59,6 +59,15 @@ type Interface interface {
 	// f.count returns the minimum length required for dst.
 	Copyall(dst []common.Pgid)
 
+	// Clone returns a deep copy of the freelist. The returned freelist is
+	// completely independent from the original one.
+	Clone() Interface
+
+	// Reset replaces the current state of the freelist with a deep copy of
+	// the given freelist's state. The given freelist must be of the same
+	// concrete type; otherwise a panic will occur.
+	Reset(other Interface)
+
 	// Reload reads the freelist from a page and filters out pending items.
 	Reload(p *common.Page)
 

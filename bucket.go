@@ -34,6 +34,7 @@ type Bucket struct {
 	page     *common.Page          // inline page reference
 	rootNode *node                 // materialized node for the root page.
 	nodes    map[common.Pgid]*node // node cache
+	epoch    uint64                // tx handle epoch at creation time; used to detect handles invalidated by a savepoint rollback
 
 	// Sets the threshold for filling nodes when they split. By default,
 	// the bucket will fill to 50% but it can be useful to increase this
@@ -45,12 +46,28 @@ type Bucket struct {
 
 // newBucket returns a new bucket associated with a transaction.
 func newBucket(tx *Tx) Bucket {
-	var b = Bucket{tx: tx, FillPercent: DefaultFillPercent}
+	var b = Bucket{tx: tx, FillPercent: DefaultFillPercent, epoch: tx.epoch}
 	if tx.writable {
 		b.buckets = make(map[string]*Bucket)
 		b.nodes = make(map[common.Pgid]*node)
 	}
 	return b
+}
+
+// checkHandleValid returns ErrSavepointRolledBack if the bucket handle has
+// been invalidated by a savepoint rollback. See Tx.RollbackToSavepoint for
+// the handle validity rule.
+func (b *Bucket) checkHandleValid() error {
+	if b.epoch != b.tx.epoch {
+		return errors.ErrSavepointRolledBack
+	}
+	return nil
+}
+
+// assertHandleValid panics if the bucket handle has been invalidated by a
+// savepoint rollback. It is used by methods which cannot return an error.
+func (b *Bucket) assertHandleValid() {
+	common.Assert(b.epoch == b.tx.epoch, "bucket handle invalidated by savepoint rollback")
 }
 
 // Tx returns the tx of the bucket.
@@ -71,7 +88,10 @@ func (b *Bucket) Writable() bool {
 // Cursor creates a cursor associated with the bucket.
 // The cursor is only valid as long as the transaction is open.
 // Do not use a cursor after the transaction is closed.
+// Do not use a cursor after the transaction is rolled back to a savepoint.
 func (b *Bucket) Cursor() *Cursor {
+	b.assertHandleValid()
+
 	// Update transaction statistics.
 	b.tx.stats.IncCursorCount(1)
 
@@ -86,6 +106,8 @@ func (b *Bucket) Cursor() *Cursor {
 // Returns nil if the bucket does not exist.
 // The bucket instance is only valid for the lifetime of the transaction.
 func (b *Bucket) Bucket(name []byte) *Bucket {
+	b.assertHandleValid()
+
 	if b.buckets != nil {
 		if child := b.buckets[string(name)]; child != nil {
 			return child
@@ -158,6 +180,8 @@ func (b *Bucket) CreateBucket(key []byte) (rb *Bucket, err error) {
 	}
 	if b.tx.db == nil {
 		return nil, errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return nil, err
 	} else if !b.tx.writable {
 		return nil, errors.ErrTxNotWritable
 	} else if len(key) == 0 {
@@ -216,6 +240,8 @@ func (b *Bucket) CreateBucketIfNotExists(key []byte) (rb *Bucket, err error) {
 
 	if b.tx.db == nil {
 		return nil, errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return nil, err
 	} else if !b.tx.writable {
 		return nil, errors.ErrTxNotWritable
 	} else if len(key) == 0 {
@@ -284,6 +310,8 @@ func (b *Bucket) DeleteBucket(key []byte) (err error) {
 
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return err
 	} else if !b.Writable() {
 		return errors.ErrTxNotWritable
 	}
@@ -348,6 +376,10 @@ func (b *Bucket) MoveBucket(key []byte, dstBucket *Bucket) (err error) {
 
 	if b.tx.db == nil || dstBucket.tx.db == nil {
 		return errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return err
+	} else if err := dstBucket.checkHandleValid(); err != nil {
+		return err
 	} else if !b.Writable() || !dstBucket.Writable() {
 		return errors.ErrTxNotWritable
 	}
@@ -462,6 +494,8 @@ func (b *Bucket) Put(key []byte, value []byte) (err error) {
 	}
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return err
 	} else if !b.Writable() {
 		return errors.ErrTxNotWritable
 	} else if len(key) == 0 {
@@ -510,6 +544,8 @@ func (b *Bucket) Delete(key []byte) (err error) {
 
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return err
 	} else if !b.Writable() {
 		return errors.ErrTxNotWritable
 	}
@@ -536,6 +572,7 @@ func (b *Bucket) Delete(key []byte) (err error) {
 
 // Sequence returns the current integer for the bucket without incrementing it.
 func (b *Bucket) Sequence() uint64 {
+	b.assertHandleValid()
 	return b.InSequence()
 }
 
@@ -543,6 +580,8 @@ func (b *Bucket) Sequence() uint64 {
 func (b *Bucket) SetSequence(v uint64) error {
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return err
 	} else if !b.Writable() {
 		return errors.ErrTxNotWritable
 	}
@@ -562,6 +601,8 @@ func (b *Bucket) SetSequence(v uint64) error {
 func (b *Bucket) NextSequence() (uint64, error) {
 	if b.tx.db == nil {
 		return 0, errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return 0, err
 	} else if !b.Writable() {
 		return 0, errors.ErrTxNotWritable
 	}
@@ -585,6 +626,8 @@ func (b *Bucket) NextSequence() (uint64, error) {
 func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return err
 	}
 	c := b.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
@@ -598,6 +641,8 @@ func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 func (b *Bucket) ForEachBucket(fn func(k []byte) error) error {
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
+	} else if err := b.checkHandleValid(); err != nil {
+		return err
 	}
 	c := b.Cursor()
 	for k, _, flags := c.first(); k != nil; k, _, flags = c.next() {
@@ -612,6 +657,7 @@ func (b *Bucket) ForEachBucket(fn func(k []byte) error) error {
 
 // Stats returns stats on a bucket.
 func (b *Bucket) Stats() BucketStats {
+	b.assertHandleValid()
 	var s, subStats BucketStats
 	pageSize := b.tx.db.pageSize
 	s.BucketN += 1

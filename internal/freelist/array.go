@@ -68,6 +68,38 @@ func (f *array) freePageIds() common.Pgids {
 	return f.ids
 }
 
+func (f *array) clone() *array {
+	c := &array{
+		shared: f.shared.cloneShared(),
+		ids:    make(common.Pgids, len(f.ids)),
+	}
+	copy(c.ids, f.ids)
+	c.Interface = c
+	return c
+}
+
+// Clone returns a deep copy of the freelist.
+func (f *array) Clone() Interface {
+	return f.clone()
+}
+
+// Reset replaces the current state of the freelist with a deep copy of
+// the given freelist's state.
+func (f *array) Reset(other Interface) {
+	o, ok := other.(*array)
+	if !ok {
+		panic(fmt.Sprintf("cannot reset an array freelist from a different freelist type: %T", other))
+	}
+	c := o.clone()
+	// Preserve the live readonly transaction list: read transactions
+	// register and unregister independently of the writer, so the
+	// snapshot's list may be stale.
+	c.shared.readonlyTXIDs = f.shared.readonlyTXIDs
+	f.shared = c.shared
+	f.ids = c.ids
+	f.Interface = f
+}
+
 func (f *array) mergeSpans(ids common.Pgids) {
 	sort.Sort(ids)
 	common.Verify(func() {
