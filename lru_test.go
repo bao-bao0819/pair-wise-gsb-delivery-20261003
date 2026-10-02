@@ -259,6 +259,88 @@ func TestLRUPeek(t *testing.T) {
 	}
 }
 
+func TestLRUGetMany(t *testing.T) {
+	l, err := New[int, int](3)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	l.Add(1, 0)
+	l.Add(2, 20)
+	l.Add(3, 30)
+
+	results := l.GetMany([]int{2, 4, 1, 2}, true)
+	want := []GetResult[int]{
+		{Value: 20, OK: true},
+		{Value: 0, OK: false},
+		{Value: 0, OK: true},
+		{Value: 20, OK: true},
+	}
+	if !reflect.DeepEqual(results, want) {
+		t.Fatalf("results got %v, want %v", results, want)
+	}
+
+	l.wantKeys(t, []int{3, 2, 1})
+}
+
+func TestLRUGetManyEvictionOrder(t *testing.T) {
+	t.Run("updates recency", func(t *testing.T) {
+		var evictedKeys []int
+		l, err := NewWithEvict[int, int](3, func(key, _ int) {
+			evictedKeys = append(evictedKeys, key)
+		})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		l.Add(1, 0)
+		l.Add(2, 20)
+		l.Add(3, 30)
+
+		results := l.GetMany([]int{2, 4, 1, 2}, true)
+		if results[1].OK {
+			t.Fatal("missing key should not be reported as found")
+		}
+
+		l.Add(4, 40)
+		l.Add(5, 50)
+		l.Add(6, 60)
+
+		l.wantKeys(t, []int{4, 5, 6})
+		if !reflect.DeepEqual(evictedKeys, []int{3, 2, 1}) {
+			t.Fatalf("evicted keys got %v, want [3 2 1]", evictedKeys)
+		}
+	})
+
+	t.Run("does not update recency", func(t *testing.T) {
+		l, err := New[int, int](3)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		l.Add(1, 0)
+		l.Add(2, 20)
+		l.Add(3, 30)
+
+		results := l.GetMany([]int{3, 4, 2, 3}, false)
+		want := []GetResult[int]{
+			{Value: 30, OK: true},
+			{Value: 0, OK: false},
+			{Value: 20, OK: true},
+			{Value: 30, OK: true},
+		}
+		if !reflect.DeepEqual(results, want) {
+			t.Fatalf("results got %v, want %v", results, want)
+		}
+
+		l.Add(4, 40)
+		l.Add(5, 50)
+		l.Add(6, 60)
+
+		l.wantKeys(t, []int{4, 5, 6})
+	})
+}
+
 // test that Resize can upsize and downsize
 func TestLRUResize(t *testing.T) {
 	onEvictCounter := 0

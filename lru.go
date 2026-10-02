@@ -14,6 +14,12 @@ const (
 	DefaultEvictedBufferSize = 16
 )
 
+// GetResult is the result of looking up a key in a batch operation.
+type GetResult[V any] struct {
+	Value V
+	OK    bool
+}
+
 // Cache is a thread-safe fixed size LRU cache.
 type Cache[K comparable, V any] struct {
 	lru         *simplelru.LRU[K, V]
@@ -97,6 +103,39 @@ func (c *Cache[K, V]) Get(key K) (value V, ok bool) {
 	value, ok = c.lru.Get(key)
 	c.lock.Unlock()
 	return value, ok
+}
+
+// GetMany looks up a group of keys and returns one result for each key in
+// the same order. When updateRecency is true, each distinct hit updates its
+// recency on its first occurrence in keys. Duplicate keys are not touched
+// again. When updateRecency is false, the cache's eviction order is unchanged.
+func (c *Cache[K, V]) GetMany(keys []K, updateRecency bool) []GetResult[V] {
+	results := make([]GetResult[V], len(keys))
+	if len(keys) == 0 {
+		return results
+	}
+
+	if !updateRecency {
+		c.lock.RLock()
+		for i, key := range keys {
+			results[i].Value, results[i].OK = c.lru.Peek(key)
+		}
+		c.lock.RUnlock()
+		return results
+	}
+
+	c.lock.Lock()
+	seen := make(map[K]struct{}, len(keys))
+	for i, key := range keys {
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			results[i].Value, results[i].OK = c.lru.Get(key)
+			continue
+		}
+		results[i].Value, results[i].OK = c.lru.Peek(key)
+	}
+	c.lock.Unlock()
+	return results
 }
 
 // Contains checks if a key is in the cache, without updating the
