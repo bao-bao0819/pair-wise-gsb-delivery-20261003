@@ -44,6 +44,28 @@ See [example_test.go][example] for a fuller example, and the [package docs][godo
 for the available options (`WithBackOff`, `WithMaxTries`, `WithMaxElapsedTime`,
 `WithNotify`).
 
+### Sharing a retry budget
+
+When many callers hit the same dependency, you may want to cap the *total*
+number of retries the group makes, not just each caller's. Pass the same
+`RetryBudget` to several `Retry` calls with `WithRetryBudget`:
+
+```go
+// At most 10 extra attempts across every caller sharing this budget.
+budget := backoff.NewTokenRetryBudget(10)
+
+result, err := backoff.Retry(ctx, operation, backoff.WithRetryBudget(budget))
+```
+
+The first attempt of each `Retry` is always free; the budget funds only
+additional attempts. When it is empty, `Retry` stops with
+`backoff.ErrBudgetExhausted`. A reservation taken for a retry is returned to
+the budget if the context is cancelled during the backoff wait; an attempt
+that has already started spends it. `NewTokenRetryBudget(n,
+backoff.WithRefillOnSuccess())` optionally adds a token back after each
+success (up to `n`), and you can implement `RetryBudget` for any other
+policy.
+
 If `Retry` does not fit your needs, copy it from [retry.go][retry-src] and adapt it.
 
 ### Handling errors
@@ -59,6 +81,8 @@ case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 	// the caller's context was cancelled or its deadline expired
 case errors.Is(err, backoff.ErrMaxElapsedTime):
 	// the WithMaxElapsedTime budget was exhausted
+case errors.Is(err, backoff.ErrBudgetExhausted):
+	// the shared RetryBudget could not fund another attempt
 case errors.Is(err, backoff.ErrExhausted):
 	// WithMaxTries was reached or the backoff policy returned Stop
 }

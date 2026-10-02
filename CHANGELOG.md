@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `RetryBudget` and the `WithRetryBudget` option let a group of concurrent `Retry` calls share a cap on how many extra attempts they may make in total. The first attempt of each call is free; when the budget runs out, `Retry` stops with the new `ErrBudgetExhausted` cause. `NewTokenRetryBudget` is a token-based implementation, optionally refilling a token after each success via `WithRefillOnSuccess`.
+- A reservation granted for a retry is returned to the budget when the context is cancelled during the backoff wait; an attempt that has already started consumes it.
+
 ## [7.0.1] - 2026-09-30
 
 ### Fixed

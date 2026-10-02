@@ -18,6 +18,10 @@ var (
 	// ErrMaxElapsedTime is the cause when retrying stops because
 	// WithMaxElapsedTime was reached.
 	ErrMaxElapsedTime = errors.New("backoff: maximum elapsed time exceeded")
+
+	// ErrBudgetExhausted is the cause when retrying stops because a shared
+	// RetryBudget (WithRetryBudget) could not fund another attempt.
+	ErrBudgetExhausted = errors.New("backoff: retry budget exhausted")
 )
 
 // RetryError is the error returned by Retry for every failure. It records the
@@ -34,6 +38,8 @@ var (
 //		// caller cancelled ctx
 //	case errors.Is(err, backoff.ErrMaxElapsedTime):
 //		// ran out of the WithMaxElapsedTime budget
+//	case errors.Is(err, backoff.ErrBudgetExhausted):
+//		// ran out of the shared RetryBudget
 //	case errors.Is(err, backoff.ErrExhausted):
 //		// hit WithMaxTries or the backoff policy stopped
 //	}
@@ -49,7 +55,8 @@ type RetryError struct {
 	// permanent failure it is the error passed to Permanent.
 	LastErr error
 	// Cause reports why retrying stopped: ErrPermanent, ErrExhausted,
-	// ErrMaxElapsedTime, or a context cancellation cause (see context.Cause).
+	// ErrMaxElapsedTime, ErrBudgetExhausted, or a context cancellation cause
+	// (see context.Cause).
 	Cause error
 }
 

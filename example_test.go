@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v7"
@@ -114,6 +115,46 @@ func ExampleRetry_outcomes() {
 		fmt.Println("last error:", re.LastErr)
 	}
 	// Output: ok
+}
+
+func ExampleRetryBudget() {
+	// One shared budget funds at most a single extra attempt across all
+	// callers that use it.
+	budget := backoff.NewTokenRetryBudget(1)
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			var calls int
+			_, err := backoff.Retry(context.Background(), func() (int, error) {
+				calls++
+				if calls < 3 {
+					return 0, errors.New("temporary failure")
+				}
+				return calls, nil
+			},
+				backoff.WithBackOff(&backoff.ZeroBackOff{}),
+				backoff.WithMaxElapsedTime(0),
+				backoff.WithRetryBudget(budget),
+			)
+
+			switch {
+			case err == nil:
+				fmt.Printf("ok after %d calls\n", calls)
+			case errors.Is(err, backoff.ErrBudgetExhausted):
+				fmt.Println("budget exhausted")
+			default:
+				fmt.Println("error:", err)
+			}
+		}()
+	}
+	wg.Wait()
+	// Unordered output:
+	// budget exhausted
+	// budget exhausted
 }
 
 func ExampleTicker() {

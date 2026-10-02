@@ -27,6 +27,7 @@ type retryOptions struct {
 	Notify         Notify        // Optional function called before each backoff wait.
 	MaxTries       uint          // Maximum number of retry attempts.
 	MaxElapsedTime time.Duration // Maximum total time for all retries.
+	Budget         RetryBudget   // Optional shared budget for extra attempts.
 }
 
 // RetryOption configures the behavior of Retry.
@@ -97,13 +98,38 @@ func WithMaxElapsedTime(d time.Duration) RetryOption {
 	}
 }
 
+// WithRetryBudget shares a RetryBudget between Retry calls to cap how many
+// extra attempts the group may make. The first attempt of each Retry call is
+// free and never touches the budget; only retries acquire budget.
+//
+// The budget is consulted last, after a Permanent error, WithMaxTries,
+// WithMaxElapsedTime, the BackOff policy, and a cancelled context have all
+// allowed another attempt, so a stop that those limits would force anyway
+// never claims budget. When the budget is exhausted Retry returns a
+// *RetryError with Cause ErrBudgetExhausted.
+//
+// If the context is cancelled during the backoff wait, the reservation taken
+// for that attempt is returned to the budget (see Reservation); an attempt
+// that has already started consumes it.
+//
+// A RetryBudget is safe for concurrent use and intended to be shared; the
+// BackOff is still per-call.
+func WithRetryBudget(b RetryBudget) RetryOption {
+	return func(args *retryOptions) {
+		args.Budget = b
+	}
+}
+
 // Retry attempts the operation until it succeeds, returns a Permanent error,
 // or backoff completes. It ensures the operation is executed at least once.
+// A RetryBudget set with WithRetryBudget can additionally cap how many extra
+// attempts a group of concurrent Retry calls may collectively make.
 //
 // On success it returns the operation result and a nil error. On any failure
 // it returns the last result and a *RetryError whose Cause reports why it
 // stopped — ErrPermanent, ErrExhausted, ErrMaxElapsedTime, or the context
-// cancellation cause — and whose LastErr holds the last operation error.
+// cancellation cause, or ErrBudgetExhausted — and whose LastErr holds the
+// last operation error.
 // See RetryError and AsRetryError.
 //
 // ctx bounds the retry loop: its cancellation or deadline stops further
@@ -132,6 +158,9 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		// Execute the operation.
 		res, err := operation()
 		if err == nil {
+			if args.Budget != nil {
+				args.Budget.Succeed()
+			}
 			return res, nil
 		}
 
@@ -185,16 +214,34 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 			return res, &RetryError{LastErr: lastErr, Cause: ErrMaxElapsedTime}
 		}
 
+		// Acquire shared retry budget last: Permanent, MaxTries, MaxElapsedTime,
+		// the backoff policy, and a cancelled context have all allowed another
+		// attempt by here, so no budget is claimed for a retry that could not
+		// happen.
+		var reservation Reservation
+		if args.Budget != nil {
+			r, ok := args.Budget.Acquire()
+			if !ok {
+				return res, &RetryError{LastErr: lastErr, Cause: ErrBudgetExhausted}
+			}
+			reservation = r
+		}
+
 		// Notify on error if a notifier function is provided.
 		if args.Notify != nil {
 			args.Notify(err, next)
 		}
 
-		// Wait for the next backoff period or context cancellation.
+		// Wait for the next backoff period or context cancellation. A timer
+		// firing means the next attempt starts and the reservation is consumed;
+		// cancellation during the wait returns the unconsumed reservation.
 		args.Timer.Start(next)
 		select {
 		case <-args.Timer.C():
 		case <-ctx.Done():
+			if reservation != nil {
+				reservation.Cancel()
+			}
 			return res, &RetryError{LastErr: lastErr, Cause: context.Cause(ctx)}
 		}
 	}
