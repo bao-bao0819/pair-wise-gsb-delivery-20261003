@@ -19,6 +19,7 @@ const (
 	contentEncoding = "Content-Encoding"
 	contentType     = "Content-Type"
 	contentLength   = "Content-Length"
+	etagHeader      = "Etag"
 )
 
 type codings map[string]float64
@@ -79,13 +80,15 @@ type GzipResponseWriter struct {
 	index int // Index for gzipWriterPools.
 	gw    *gzip.Writer
 
-	code int // Saves the WriteHeader value.
+	code   int // Saves the WriteHeader value.
+	method string
 
 	minSize int    // Specifies the minimum response size to gzip. If the response length is bigger than this value, it is compressed.
 	buf     []byte // Holds the first part of the write before reaching the minSize or the end of the write.
 	ignore  bool   // If true, then we immediately passthru writes to the underlying ResponseWriter.
 
 	contentTypes []parsedContentType // Only compress if the response is one of these content-types. All are accepted if empty.
+	etagPolicy   ETagPolicyFunc
 }
 
 type GzipResponseWriterWithCloseNotify struct {
@@ -118,7 +121,7 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 		ce    = w.Header().Get(contentEncoding)
 	)
 	// Only continue if they didn't already choose an encoding or a known unhandled content length or type.
-	if ce == "" && (cl == 0 || cl >= w.minSize) && (ct == "" || handleContentType(w.contentTypes, ct)) {
+	if w.allowsCompression() && ce == "" && (cl == 0 || cl >= w.minSize) && (ct == "" || handleContentType(w.contentTypes, ct)) {
 		// If the current buffer is less than minSize and a Content-Length isn't set, then wait until we have more data.
 		if len(w.buf) < w.minSize && cl == 0 {
 			return len(b), nil
@@ -146,8 +149,25 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+func (w *GzipResponseWriter) allowsCompression() bool {
+	if w.method == http.MethodHead {
+		return false
+	}
+
+	switch w.code {
+	case http.StatusNoContent, http.StatusNotModified:
+		return false
+	}
+
+	return true
+}
+
 // startGzip initializes a GZIP writer and writes the buffer.
 func (w *GzipResponseWriter) startGzip() error {
+	if len(w.buf) == 0 {
+		return nil
+	}
+
 	// Set the GZIP header.
 	w.Header().Set(contentEncoding, "gzip")
 
@@ -156,6 +176,8 @@ func (w *GzipResponseWriter) startGzip() error {
 	// See: https://github.com/golang/go/issues/14975.
 	w.Header().Del(contentLength)
 
+	w.applyETagPolicy()
+
 	// Write the header to gzip response.
 	if w.code != 0 {
 		w.ResponseWriter.WriteHeader(w.code)
@@ -163,23 +185,17 @@ func (w *GzipResponseWriter) startGzip() error {
 		w.code = 0
 	}
 
-	// Initialize and flush the buffer into the gzip response if there are any bytes.
-	// If there aren't any, we shouldn't initialize it yet because on Close it will
-	// write the gzip header even if nothing was ever written.
-	if len(w.buf) > 0 {
-		// Initialize the GZIP response.
-		w.init()
-		n, err := w.gw.Write(w.buf)
+	// Initialize the GZIP response.
+	w.init()
+	n, err := w.gw.Write(w.buf)
 
-		// This should never happen (per io.Writer docs), but if the write didn't
-		// accept the entire buffer but returned no specific error, we have no clue
-		// what's going on, so abort just to be safe.
-		if err == nil && n < len(w.buf) {
-			err = io.ErrShortWrite
-		}
-		return err
+	// This should never happen (per io.Writer docs), but if the write didn't
+	// accept the entire buffer but returned no specific error, we have no clue
+	// what's going on, so abort just to be safe.
+	if err == nil && n < len(w.buf) {
+		err = io.ErrShortWrite
 	}
-	return nil
+	return err
 }
 
 // startPlain writes to sent bytes and buffer the underlying ResponseWriter without gzip.
@@ -210,6 +226,36 @@ func (w *GzipResponseWriter) WriteHeader(code int) {
 	if w.code == 0 {
 		w.code = code
 	}
+}
+
+func (w *GzipResponseWriter) applyETagPolicy() {
+	if w.etagPolicy == nil {
+		return
+	}
+
+	headers := w.Header()
+	tag, found, valid := readETag(headers)
+	if !valid {
+		if found {
+			headers.Del(etagHeader)
+		}
+		return
+	}
+	if !found {
+		return
+	}
+
+	newTag := w.etagPolicy(tag, "gzip")
+	if newTag == "" {
+		headers.Del(etagHeader)
+		return
+	}
+	if _, valid := parseETag(newTag); !valid {
+		headers.Del(etagHeader)
+		return
+	}
+
+	headers.Set(etagHeader, newTag)
 }
 
 // init graps a new gzip writer from the gzipWriterPool and writes the correct
@@ -326,8 +372,10 @@ func GzipHandlerWithOpts(opts ...option) (func(http.Handler) http.Handler, error
 				gw := &GzipResponseWriter{
 					ResponseWriter: w,
 					index:          index,
+					method:         r.Method,
 					minSize:        c.minSize,
 					contentTypes:   c.contentTypes,
+					etagPolicy:     c.etagPolicy,
 				}
 				defer gw.Close()
 
@@ -379,6 +427,7 @@ type config struct {
 	minSize      int
 	level        int
 	contentTypes []parsedContentType
+	etagPolicy   ETagPolicyFunc
 }
 
 func (c *config) validate() error {
@@ -395,6 +444,31 @@ func (c *config) validate() error {
 
 type option func(c *config)
 
+// ETagPolicyFunc updates an ETag header immediately before compressed headers are
+// committed. The tag is a valid single ETag. The encoding identifies the
+// content encoding being applied. A missing ETag is not changed. Multiple or
+// malformed ETags are removed without calling the function. Returning an empty
+// string removes the ETag header; returning another malformed value also
+// removes it.
+type ETagPolicyFunc func(tag, encoding string) string
+
+// DeleteStrongETag removes a strong ETag and preserves a weak ETag.
+func DeleteStrongETag(tag, encoding string) string {
+	if strings.HasPrefix(tag, "W/") {
+		return tag
+	}
+	return ""
+}
+
+// WeakenStrongETag turns a strong ETag into a weak ETag. An ETag which
+// is already weak is returned without adding another prefix.
+func WeakenStrongETag(tag, encoding string) string {
+	if strings.HasPrefix(tag, "W/") {
+		return tag
+	}
+	return "W/" + tag
+}
+
 func MinSize(size int) option {
 	return func(c *config) {
 		c.minSize = size
@@ -404,6 +478,14 @@ func MinSize(size int) option {
 func CompressionLevel(level int) option {
 	return func(c *config) {
 		c.level = level
+	}
+}
+
+// ETagPolicy sets the policy used when a response is actually compressed.
+// Passthrough responses retain their ETag without invoking the policy.
+func ETagPolicy(policy ETagPolicyFunc) option {
+	return func(c *config) {
+		c.etagPolicy = policy
 	}
 }
 
@@ -529,4 +611,59 @@ func parseCoding(s string) (coding string, qvalue float64, err error) {
 	}
 
 	return
+}
+
+func readETag(headers http.Header) (tag string, found bool, valid bool) {
+	values, ok := headers[etagHeader]
+	if !ok {
+		return "", false, true
+	}
+	if len(values) != 1 {
+		return "", true, false
+	}
+	if hasMultipleETags(values[0]) {
+		return "", true, false
+	}
+
+	tag, valid = parseETag(values[0])
+	return tag, true, valid
+}
+
+func hasMultipleETags(value string) bool {
+	inTag := false
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '"':
+			inTag = !inTag
+		case ',':
+			if !inTag {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func parseETag(value string) (string, bool) {
+	tag := strings.TrimSpace(value)
+	if len(tag) < 2 {
+		return "", false
+	}
+
+	if strings.HasPrefix(tag, "W/") {
+		tag = tag[2:]
+	}
+
+	if tag[0] != '"' || tag[len(tag)-1] != '"' || len(tag) == 2 {
+		return "", false
+	}
+
+	for i := 1; i < len(tag)-1; i++ {
+		c := tag[i]
+		if c == '"' || c < 0x21 || (c > 0x7e && c < 0x80) {
+			return "", false
+		}
+	}
+
+	return strings.TrimSpace(value), true
 }

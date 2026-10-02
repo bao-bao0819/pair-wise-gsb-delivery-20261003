@@ -158,15 +158,15 @@ func TestGzipHandlerNoBody(t *testing.T) {
 	tests := []struct {
 		statusCode      int
 		contentEncoding string
-		emptyBody       bool
+		expectEmptyBody bool
 		body            []byte
+		method          string
 	}{
 		// Body must be empty.
-		{http.StatusNoContent, "", true, nil},
-		{http.StatusNotModified, "", true, nil},
-		// Body is going to get gzip'd no matter what.
-		{http.StatusOK, "", true, []byte{}},
-		{http.StatusOK, "gzip", false, []byte(testBody)},
+		{http.StatusNoContent, "", true, nil, http.MethodGet},
+		{http.StatusNotModified, "", true, nil, http.MethodGet},
+		{http.StatusOK, "", true, []byte{}, http.MethodGet},
+		{http.StatusOK, "gzip", false, []byte(testBody), http.MethodGet},
 	}
 
 	for num, test := range tests {
@@ -188,6 +188,7 @@ func TestGzipHandlerNoBody(t *testing.T) {
 			RemoteAddr: "192.0.2.1:1234",
 			Header:     make(http.Header),
 		}
+		req.Method = test.method
 		req.Header.Set("Accept-Encoding", "gzip")
 		handler.ServeHTTP(rec, req)
 
@@ -199,7 +200,7 @@ func TestGzipHandlerNoBody(t *testing.T) {
 		header := rec.Header()
 		assert.Equal(t, test.contentEncoding, header.Get("Content-Encoding"), fmt.Sprintf("for test iteration %d", num))
 		assert.Equal(t, "Accept-Encoding", header.Get("Vary"), fmt.Sprintf("for test iteration %d", num))
-		if test.emptyBody {
+		if test.expectEmptyBody {
 			assert.Empty(t, body, fmt.Sprintf("for test iteration %d", num))
 		} else {
 			assert.NotEmpty(t, body, fmt.Sprintf("for test iteration %d", num))
@@ -211,17 +212,18 @@ func TestGzipHandlerNoBody(t *testing.T) {
 func TestGzipHandlerContentLength(t *testing.T) {
 	testBodyBytes := []byte(testBody)
 	tests := []struct {
-		bodyLen   int
-		bodies    [][]byte
-		emptyBody bool
+		bodyLen    int
+		bodies     [][]byte
+		method     string
+		compressed bool
 	}{
-		{len(testBody), [][]byte{testBodyBytes}, false},
+		{len(testBody), [][]byte{testBodyBytes}, http.MethodGet, true},
 		// each of these writes is less than the DefaultMinSize
-		{len(testBody), [][]byte{testBodyBytes[:200], testBodyBytes[200:]}, false},
+		{len(testBody), [][]byte{testBodyBytes[:200], testBodyBytes[200:]}, http.MethodGet, true},
 		// without a defined Content-Length it should still gzip
-		{0, [][]byte{testBodyBytes[:200], testBodyBytes[200:]}, false},
+		{0, [][]byte{testBodyBytes[:200], testBodyBytes[200:]}, http.MethodGet, true},
 		// simulate a HEAD request with an empty write (to populate headers)
-		{len(testBody), [][]byte{nil}, true},
+		{len(testBody), [][]byte{nil}, http.MethodHead, false},
 	}
 
 	// httptest.NewRecorder doesn't give you access to the Content-Length
@@ -247,7 +249,7 @@ func TestGzipHandlerContentLength(t *testing.T) {
 			}
 		}))
 		req := &http.Request{
-			Method: "GET",
+			Method: test.method,
 			URL:    &url.URL{Path: "/", Scheme: "http", Host: ln.Addr().String()},
 			Header: make(http.Header),
 			Close:  true,
@@ -268,14 +270,24 @@ func TestGzipHandlerContentLength(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Unexpected error parsing Content-Length in test iteration %d: %v", num, err)
 		}
-		if test.emptyBody {
+		if !test.compressed {
 			assert.Empty(t, body, fmt.Sprintf("for test iteration %d", num))
-			assert.Equal(t, 0, l, fmt.Sprintf("for test iteration %d", num))
+			expectedLength := 0
+			if test.method == http.MethodHead {
+				expectedLength = test.bodyLen
+			}
+			assert.Equal(t, expectedLength, l, fmt.Sprintf("for test iteration %d", num))
 		} else {
 			assert.Len(t, body, l, fmt.Sprintf("for test iteration %d", num))
 		}
-		assert.Equal(t, "gzip", res.Header.Get("Content-Encoding"), fmt.Sprintf("for test iteration %d", num))
-		assert.NotEqual(t, test.bodyLen, l, fmt.Sprintf("for test iteration %d", num))
+		expectedEncoding := ""
+		if test.compressed {
+			expectedEncoding = "gzip"
+		}
+		assert.Equal(t, expectedEncoding, res.Header.Get("Content-Encoding"), fmt.Sprintf("for test iteration %d", num))
+		if test.compressed {
+			assert.NotEqual(t, test.bodyLen, l, fmt.Sprintf("for test iteration %d", num))
+		}
 	}
 }
 
@@ -393,7 +405,7 @@ func TestGzipHandlerDoubleWriteHeader(t *testing.T) {
 	}
 	assert.Empty(t, body)
 	header := rec.Header()
-	assert.Equal(t, "gzip", header.Get("Content-Encoding"))
+	assert.Equal(t, "", header.Get("Content-Encoding"))
 	assert.Equal(t, "Accept-Encoding", header.Get("Vary"))
 	assert.Equal(t, 304, rec.Code)
 }
@@ -604,6 +616,263 @@ func TestContentTypes(t *testing.T) {
 			assert.NotEqual(t, "gzip", res.Header.Get("Content-Encoding"), tt.name)
 		}
 	}
+}
+
+func TestETagPolicy(t *testing.T) {
+	tests := []struct {
+		name     string
+		header   []string
+		policy   ETagPolicyFunc
+		expected []string
+	}{
+		{
+			name:     "delete strong",
+			header:   []string{`"v1"`},
+			policy:   DeleteStrongETag,
+			expected: nil,
+		},
+		{
+			name:     "delete preserves weak",
+			header:   []string{`W/"v1"`},
+			policy:   DeleteStrongETag,
+			expected: []string{`W/"v1"`},
+		},
+		{
+			name:     "weaken strong",
+			header:   []string{`"v1"`},
+			policy:   WeakenStrongETag,
+			expected: []string{`W/"v1"`},
+		},
+		{
+			name:     "weaken does not duplicate prefix",
+			header:   []string{`W/"v1"`},
+			policy:   WeakenStrongETag,
+			expected: []string{`W/"v1"`},
+		},
+		{
+			name:     "caller replaces tag by encoding",
+			header:   []string{`"v1"`},
+			policy:   func(tag, encoding string) string { return `"` + encoding + `:v1"` },
+			expected: []string{`"gzip:v1"`},
+		},
+		{
+			name:     "caller preserves tag",
+			header:   []string{`"v1"`},
+			policy:   func(tag, encoding string) string { return tag },
+			expected: []string{`"v1"`},
+		},
+		{
+			name:     "multiple values in one header are removed",
+			header:   []string{`"v1", "v2"`},
+			policy:   WeakenStrongETag,
+			expected: nil,
+		},
+		{
+			name:     "multiple header values are removed",
+			header:   []string{`"v1"`, `"v2"`},
+			policy:   WeakenStrongETag,
+			expected: nil,
+		},
+		{
+			name:     "invalid tag is removed",
+			header:   []string{`v1`},
+			policy:   WeakenStrongETag,
+			expected: nil,
+		},
+		{
+			name:     "invalid policy result is removed",
+			header:   []string{`"v1"`},
+			policy:   func(tag, encoding string) string { return "v1" },
+			expected: nil,
+		},
+	}
+
+	for _, test := range tests {
+		wrapper, err := GzipHandlerWithOpts(
+			MinSize(1),
+			ETagPolicy(test.policy),
+		)
+		if !assert.NoError(t, err, test.name) {
+			continue
+		}
+
+		handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for _, value := range test.header {
+				w.Header().Add("Etag", value)
+			}
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, testBody)
+		}))
+
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, "gzip", rec.Header().Get(contentEncoding), test.name)
+		assert.Equal(t, test.expected, rec.Header()["Etag"], test.name)
+	}
+}
+
+func TestETagPolicyPassthrough(t *testing.T) {
+	calls := 0
+	policy := func(tag, encoding string) string {
+		calls++
+		return `W/"new"`
+	}
+
+	tests := []struct {
+		name       string
+		method     string
+		statusCode int
+		body       string
+		minSize    int
+		etag       string
+	}{
+		{"below threshold", http.MethodGet, http.StatusOK, smallTestBody, 1400, `"original"`},
+		{"malformed below threshold", http.MethodGet, http.StatusOK, smallTestBody, 1400, `original`},
+		{"204", http.MethodGet, http.StatusNoContent, "", 1, `"original"`},
+		{"304", http.MethodGet, http.StatusNotModified, "", 1, `"original"`},
+		{"HEAD", http.MethodHead, http.StatusOK, testBody, 1, `"original"`},
+	}
+
+	for _, test := range tests {
+		calls = 0
+		wrapper, err := GzipHandlerWithOpts(
+			MinSize(test.minSize),
+			ETagPolicy(policy),
+		)
+		if !assert.NoError(t, err, test.name) {
+			continue
+		}
+
+		handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Etag", test.etag)
+			w.WriteHeader(test.statusCode)
+			io.WriteString(w, test.body)
+		}))
+
+		req := httptest.NewRequest(test.method, "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, "", rec.Header().Get(contentEncoding), test.name)
+		assert.Equal(t, test.etag, rec.Header().Get("Etag"), test.name)
+		assert.Equal(t, 0, calls, test.name)
+	}
+}
+
+func TestETagPolicyReceivesCurrentTagAndEncoding(t *testing.T) {
+	var gotTag string
+	var gotEncoding string
+
+	wrapper, err := GzipHandlerWithOpts(
+		MinSize(1),
+		ETagPolicy(func(tag, encoding string) string {
+			gotTag = tag
+			gotEncoding = encoding
+			return tag
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Etag", `"v1"`)
+		io.WriteString(w, testBody)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, `"v1"`, gotTag)
+	assert.Equal(t, "gzip", gotEncoding)
+	assert.Equal(t, `"v1"`, rec.Header().Get("Etag"))
+}
+
+func TestETagDefaultsToPreservingHeader(t *testing.T) {
+	wrapper, err := GzipHandlerWithOpts(MinSize(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Etag", `"v1"`)
+		io.WriteString(w, testBody)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, "gzip", rec.Header().Get(contentEncoding))
+	assert.Equal(t, `"v1"`, rec.Header().Get("Etag"))
+}
+
+type etagCommitRecorder struct {
+	*httptest.ResponseRecorder
+	committed string
+}
+
+func (w *etagCommitRecorder) WriteHeader(statusCode int) {
+	w.committed = w.Header().Get("Etag")
+	w.ResponseRecorder.WriteHeader(statusCode)
+}
+
+func TestETagPolicyRunsBeforeHeaderCommit(t *testing.T) {
+	wrapper, err := GzipHandlerWithOpts(
+		MinSize(1),
+		ETagPolicy(WeakenStrongETag),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Etag", `"original"`)
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, testBody)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := &etagCommitRecorder{ResponseRecorder: httptest.NewRecorder()}
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, `W/"original"`, rec.committed)
+	assert.Equal(t, `W/"original"`, rec.Header().Get("Etag"))
+}
+
+func TestParseETag(t *testing.T) {
+	tests := []struct {
+		value string
+		valid bool
+	}{
+		{`"strong"`, true},
+		{`W/"weak"`, true},
+		{` W/"weak" `, true},
+		{`W/W/"weak"`, false},
+		{`w/"weak"`, false},
+		{`"missing-quote`, false},
+		{`"has,comma"`, true},
+		{`""`, false},
+		{``, false},
+	}
+
+	for _, test := range tests {
+		_, valid := parseETag(test.value)
+		assert.Equal(t, test.valid, valid, test.value)
+	}
+}
+
+func TestHasMultipleETags(t *testing.T) {
+	assert.True(t, hasMultipleETags(`"a", "b"`))
+	assert.True(t, hasMultipleETags(`W/"a", W/"b"`))
+	assert.False(t, hasMultipleETags(`"a,b"`))
+	assert.False(t, hasMultipleETags(`W/"a"`))
 }
 
 // --------------------------------------------------------------------

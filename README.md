@@ -39,6 +39,30 @@ func main() {
 }
 ```
 
+## ETags
+
+Gzip changes the response representation, so a strong ETag cannot remain
+unchanged when compression is applied. Configure an ETag policy with
+`GzipHandlerWithOpts`:
+
+```go
+// Remove strong ETags, but preserve weak ETags.
+wrapper, _ := gziphandler.GzipHandlerWithOpts(gziphandler.ETagPolicy(gziphandler.DeleteStrongETag))
+
+// Convert a strong ETag such as "v1" into W/"v1".
+wrapper, _ := gziphandler.GzipHandlerWithOpts(gziphandler.ETagPolicy(gziphandler.WeakenStrongETag))
+
+// Generate a representation-specific ETag. The encoding is "gzip".
+wrapper, _ := gziphandler.GzipHandlerWithOpts(gziphandler.ETagPolicy(func(tag, encoding string) string {
+    return `"` + encoding + `-version"`
+}))
+```
+
+The policy runs only when a response is actually compressed. HEAD responses,
+204 and 304 responses, already-encoded responses, and responses below the
+minimum size remain unchanged. Multiple or malformed ETag values are removed
+before compressed headers are committed.
+
 
 ## Documentation
 
