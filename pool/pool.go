@@ -37,7 +37,23 @@ type Pool struct {
 // Go submits a task to be run in the pool. If all goroutines in the pool
 // are busy, a call to Go() will block until the task can be started.
 func (p *Pool) Go(f func()) {
+	p.GoContext(context.Background(), f)
+}
+
+// GoContext submits a task to be run in the pool, like Go, but allows the
+// caller to cancel the wait for a free slot in the pool. The context only
+// governs the submission itself - it is not propagated to the task.
+//
+// If GoContext returns nil, the task has been accepted by the pool and is
+// guaranteed to be run (and counted by Wait). If the context is cancelled
+// while waiting for a free slot, GoContext returns the context's error and
+// the task is guaranteed to never run.
+func (p *Pool) GoContext(ctx context.Context, f func()) error {
 	p.init()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if p.limiter == nil {
 		// No limit on the number of goroutines.
@@ -61,10 +77,15 @@ func (p *Pool) Go(f func()) {
 			})
 		case p.tasks <- f:
 			// A worker is available and has accepted the task.
-			return
+			return nil
+		case <-ctx.Done():
+			// The context was cancelled before a slot became available.
+			// The task was not accepted and will never run.
+			return ctx.Err()
 		}
 	}
 
+	return nil
 }
 
 // Wait cleans up spawned goroutines, propagating any panics that were

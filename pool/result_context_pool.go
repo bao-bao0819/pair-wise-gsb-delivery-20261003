@@ -20,12 +20,32 @@ type ResultContextPool[T any] struct {
 // Go submits a task to the pool. If all goroutines in the pool
 // are busy, a call to Go() will block until the task can be started.
 func (p *ResultContextPool[T]) Go(f func(context.Context) (T, error)) {
+	p.GoContext(context.Background(), f)
+}
+
+// GoContext submits a task to the pool, like Go, but allows the caller to
+// cancel the wait for a free slot in the pool. The context passed to
+// GoContext only governs the submission itself - the task still runs under
+// the pool's own context.
+//
+// If GoContext returns nil, the task has been accepted by the pool and is
+// guaranteed to be run (and counted by Wait). If the context is cancelled
+// while waiting for a free slot, GoContext returns the context's error and
+// the task is guaranteed to never run. Rejected tasks leave no trace in the
+// results returned by Wait - no placeholder zero values and no gaps.
+func (p *ResultContextPool[T]) GoContext(ctx context.Context, f func(context.Context) (T, error)) error {
 	idx := p.agg.nextIndex()
-	p.contextPool.Go(func(ctx context.Context) error {
+	err := p.contextPool.GoContext(ctx, func(ctx context.Context) error {
 		res, err := f(ctx)
 		p.agg.save(idx, res, err != nil)
 		return err
 	})
+	if err != nil {
+		// The task was not accepted, so release its reserved slot to
+		// avoid leaving a zero-valued hole in the results.
+		p.agg.cancelIndex(idx)
+	}
+	return err
 }
 
 // Wait cleans up all spawned goroutines, propagates any panics, and

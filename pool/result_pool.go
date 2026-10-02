@@ -30,10 +30,29 @@ type ResultPool[T any] struct {
 // Go submits a task to the pool. If all goroutines in the pool
 // are busy, a call to Go() will block until the task can be started.
 func (p *ResultPool[T]) Go(f func() T) {
+	p.GoContext(context.Background(), f)
+}
+
+// GoContext submits a task to the pool, like Go, but allows the caller to
+// cancel the wait for a free slot in the pool. The context only governs the
+// submission itself - it is not propagated to the task.
+//
+// If GoContext returns nil, the task has been accepted by the pool and is
+// guaranteed to be run (and counted by Wait). If the context is cancelled
+// while waiting for a free slot, GoContext returns the context's error and
+// the task is guaranteed to never run. Rejected tasks leave no trace in the
+// results returned by Wait - no placeholder zero values and no gaps.
+func (p *ResultPool[T]) GoContext(ctx context.Context, f func() T) error {
 	idx := p.agg.nextIndex()
-	p.pool.Go(func() {
+	err := p.pool.GoContext(ctx, func() {
 		p.agg.save(idx, f(), false)
 	})
+	if err != nil {
+		// The task was not accepted, so release its reserved slot to
+		// avoid leaving a zero-valued hole in the results.
+		p.agg.cancelIndex(idx)
+	}
+	return err
 }
 
 // Wait cleans up all spawned goroutines, propagating any panics, and returning
@@ -85,10 +104,11 @@ func (p *ResultPool[T]) panicIfInitialized() {
 // resultAggregator is a utility type that lets us safely append from multiple
 // goroutines. The zero value is valid and ready to use.
 type resultAggregator[T any] struct {
-	mu      sync.Mutex
-	len     int
-	results []T
-	errored []int
+	mu        sync.Mutex
+	len       int
+	results   []T
+	errored   []int
+	cancelled []int
 }
 
 // nextIndex reserves a slot for a result. The returned value should be passed
@@ -100,6 +120,16 @@ func (r *resultAggregator[T]) nextIndex() int {
 	nextIdx := r.len
 	r.len += 1
 	return nextIdx
+}
+
+// cancelIndex releases a slot previously reserved with nextIndex for a task
+// that was never accepted by the pool. The slot is skipped when collecting
+// results so that no zero-valued placeholder or gap remains.
+func (r *resultAggregator[T]) cancelIndex(i int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.cancelled = append(r.cancelled, i)
 }
 
 func (r *resultAggregator[T]) save(i int, res T, errored bool) {
@@ -125,18 +155,23 @@ func (r *resultAggregator[T]) collect(collectErrored bool) []T {
 		panic("collect should not be called until all goroutines have exited")
 	}
 
-	if collectErrored || len(r.errored) == 0 {
+	var skipped []int
+	if !collectErrored {
+		skipped = append(skipped, r.errored...)
+	}
+	skipped = append(skipped, r.cancelled...)
+
+	if len(skipped) == 0 {
 		return r.results
 	}
 
 	filtered := r.results[:0]
-	sort.Ints(r.errored)
-	for i, e := range r.errored {
-		if i == 0 {
-			filtered = append(filtered, r.results[:e]...)
-		} else {
-			filtered = append(filtered, r.results[r.errored[i-1]+1:e]...)
-		}
+	sort.Ints(skipped)
+	prev := 0
+	for _, s := range skipped {
+		filtered = append(filtered, r.results[prev:s]...)
+		prev = s + 1
 	}
+	filtered = append(filtered, r.results[prev:]...)
 	return filtered
 }
