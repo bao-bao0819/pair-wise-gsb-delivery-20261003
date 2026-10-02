@@ -37,6 +37,7 @@ then configured with methods:
 - [`p.WithErrors()`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#Pool.WithErrors) configures the pool to run tasks that return errors
 - [`p.WithContext(ctx)`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#Pool.WithContext) configures the pool to run tasks that should be canceled on first error
 - [`p.WithFirstError()`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ErrorPool.WithFirstError) configures error pools to only keep the first returned error rather than an aggregated error
+- [`p.WithOrderedErrors()`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ErrorPool.WithOrderedErrors) configures error pools to aggregate errors in task submission order, wrapping each in a `TaskError` with the task's index
 - [`p.WithCollectErrored()`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ResultContextPool.WithCollectErrored) configures result pools to collect results even when the task errored
 
 # Goals

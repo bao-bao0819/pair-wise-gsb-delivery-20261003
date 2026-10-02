@@ -63,6 +63,64 @@ func TestResultErrorPool(t *testing.T) {
 		require.ErrorIs(t, err, err1)
 	})
 
+	t.Run("WithOrderedErrors", func(t *testing.T) {
+		t.Parallel()
+		g := pool.NewWithResults[int]().WithErrors().WithOrderedErrors()
+		// The task with the lowest submission index fails last, so completion
+		// order differs from submission order.
+		g.Go(func() (int, error) {
+			time.Sleep(100 * time.Millisecond)
+			return 0, err1
+		})
+		g.Go(func() (int, error) { return 1, nil })
+		g.Go(func() (int, error) { return 0, err2 })
+		res, err := g.Wait()
+		require.Equal(t, []int{1}, res)
+		require.ErrorIs(t, err, err1)
+		require.ErrorIs(t, err, err2)
+
+		// Errors are ordered by submission index and can be traced back to
+		// their task even though errored results are filtered out.
+		joined, ok := err.(interface{ Unwrap() []error })
+		require.True(t, ok)
+		unwrapped := joined.Unwrap()
+		require.Len(t, unwrapped, 2)
+		var terr *pool.TaskError
+		require.ErrorAs(t, unwrapped[0], &terr)
+		require.Equal(t, 0, terr.Index)
+		require.Equal(t, err1, terr.Err)
+		require.ErrorAs(t, unwrapped[1], &terr)
+		require.Equal(t, 2, terr.Index)
+		require.Equal(t, err2, terr.Err)
+	})
+
+	t.Run("WithOrderedErrors and WithCollectErrored", func(t *testing.T) {
+		t.Parallel()
+		g := pool.NewWithResults[int]().WithErrors().WithOrderedErrors().WithCollectErrored()
+		g.Go(func() (int, error) {
+			time.Sleep(100 * time.Millisecond)
+			return 0, err1
+		})
+		g.Go(func() (int, error) { return 1, nil })
+		g.Go(func() (int, error) { return 2, err2 })
+		res, err := g.Wait()
+		require.Equal(t, []int{0, 1, 2}, res)
+		require.ErrorIs(t, err, err1)
+		require.ErrorIs(t, err, err2)
+
+		// TaskError.Index aligns with the position of the task's result in
+		// the collected results.
+		joined, ok := err.(interface{ Unwrap() []error })
+		require.True(t, ok)
+		unwrapped := joined.Unwrap()
+		require.Len(t, unwrapped, 2)
+		var terr *pool.TaskError
+		require.ErrorAs(t, unwrapped[0], &terr)
+		require.Equal(t, 0, terr.Index)
+		require.ErrorAs(t, unwrapped[1], &terr)
+		require.Equal(t, 2, terr.Index)
+	})
+
 	t.Run("WithFirstError", func(t *testing.T) {
 		t.Parallel()
 		g := pool.NewWithResults[int]().WithErrors().WithFirstError()

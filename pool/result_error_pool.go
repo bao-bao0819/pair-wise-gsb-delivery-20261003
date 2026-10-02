@@ -67,6 +67,19 @@ func (p *ResultErrorPool[T]) WithFirstError() *ResultErrorPool[T] {
 	return p
 }
 
+// WithOrderedErrors configures the pool to aggregate errors in the order the
+// tasks were submitted with Go(), rather than the order in which they
+// happened to complete. Each error in the aggregated error is wrapped in a
+// *TaskError that records the submission index of the task that returned it,
+// so errors can be traced back to their task whether or not errored results
+// are collected (see WithCollectErrored). See (*ErrorPool).WithOrderedErrors
+// for details.
+func (p *ResultErrorPool[T]) WithOrderedErrors() *ResultErrorPool[T] {
+	p.panicIfInitialized()
+	p.errorPool.WithOrderedErrors()
+	return p
+}
+
 // WithMaxGoroutines limits the number of goroutines in a pool.
 // Defaults to unlimited. Panics if n < 1.
 func (p *ResultErrorPool[T]) WithMaxGoroutines(n int) *ResultErrorPool[T] {

@@ -22,7 +22,8 @@ type ContextPool struct {
 // collected and returned by Wait(). If all goroutines in the pool
 // are busy, a call to Go() will block until the task can be started.
 func (p *ContextPool) Go(f func(ctx context.Context) error) {
-	p.errorPool.Go(func() error {
+	idx := p.errorPool.nextIndex()
+	p.errorPool.goWithIndex(idx, func() error {
 		if p.cancelOnError {
 			// If we are cancelling on error, then we also want to cancel if a
 			// panic is raised. To do this, we need to recover, cancel, and then
@@ -41,7 +42,7 @@ func (p *ContextPool) Go(f func(ctx context.Context) error) {
 			// otherwise, canceling could cause another goroutine to exit and
 			// return an error before this error was added, which breaks the
 			// expectations of WithFirstError().
-			p.errorPool.addErr(err)
+			p.errorPool.addErr(idx, err)
 			p.cancel()
 			return nil
 		}
@@ -64,6 +65,15 @@ func (p *ContextPool) Wait() error {
 func (p *ContextPool) WithFirstError() *ContextPool {
 	p.panicIfInitialized()
 	p.errorPool.WithFirstError()
+	return p
+}
+
+// WithOrderedErrors configures the pool to aggregate errors in the order the
+// tasks were submitted with Go(), rather than the order in which they
+// happened to complete. See (*ErrorPool).WithOrderedErrors for details.
+func (p *ContextPool) WithOrderedErrors() *ContextPool {
+	p.panicIfInitialized()
+	p.errorPool.WithOrderedErrors()
 	return p
 }
 

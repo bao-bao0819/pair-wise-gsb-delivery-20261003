@@ -78,6 +78,58 @@ func TestErrorPool(t *testing.T) {
 		require.ErrorIs(t, err, err2)
 	})
 
+	t.Run("ordered errors are aggregated in submission order", func(t *testing.T) {
+		t.Parallel()
+		const tasks = 10
+		errs := make([]error, tasks)
+		for i := range errs {
+			errs[i] = fmt.Errorf("err%d", i)
+		}
+		g := pool.New().WithErrors().WithOrderedErrors()
+		for i := 0; i < tasks; i++ {
+			i := i
+			g.Go(func() error {
+				// Sleep so that tasks complete in reverse submission order.
+				time.Sleep(time.Duration(tasks-i) * time.Millisecond)
+				return errs[i]
+			})
+		}
+		err := g.Wait()
+		require.Error(t, err)
+
+		// The original errors remain accessible via errors.Is.
+		for _, want := range errs {
+			require.ErrorIs(t, err, want)
+		}
+
+		// The aggregated errors are ordered by submission index, and each is
+		// wrapped in a *TaskError that locates it back to its task.
+		joined, ok := err.(interface{ Unwrap() []error })
+		require.True(t, ok)
+		unwrapped := joined.Unwrap()
+		require.Len(t, unwrapped, tasks)
+		for i, u := range unwrapped {
+			var terr *pool.TaskError
+			require.ErrorAs(t, u, &terr)
+			require.Equal(t, i, terr.Index)
+			require.Equal(t, errs[i], terr.Err)
+		}
+	})
+
+	t.Run("first error is first to fail, not lowest index, with ordered errors", func(t *testing.T) {
+		t.Parallel()
+		g := pool.New().WithErrors().WithFirstError().WithOrderedErrors()
+		g.Go(func() error {
+			// The task with the lowest submission index fails last.
+			time.Sleep(100 * time.Millisecond)
+			return err1
+		})
+		g.Go(func() error { return err2 })
+		err := g.Wait()
+		require.Equal(t, err2, err)
+		require.NotErrorIs(t, err, err1)
+	})
+
 	t.Run("propagates panics", func(t *testing.T) {
 		t.Parallel()
 		g := pool.New().WithErrors()
@@ -131,5 +183,26 @@ func TestErrorPool(t *testing.T) {
 		// On reuse, only the new error should be returned
 		require.ErrorIs(t, wait2, err2)
 		require.NotErrorIs(t, wait1, err2)
+	})
+
+	t.Run("reuse resets ordered error indices", func(t *testing.T) {
+		p := pool.New().WithErrors().WithOrderedErrors()
+
+		p.Go(func() error { return nil })
+		p.Go(func() error { return err1 })
+		wait1 := p.Wait()
+		var terr1 *pool.TaskError
+		require.ErrorAs(t, wait1, &terr1)
+		require.Equal(t, 1, terr1.Index)
+		require.ErrorIs(t, wait1, err1)
+
+		p.Go(func() error { return err2 })
+		wait2 := p.Wait()
+		var terr2 *pool.TaskError
+		require.ErrorAs(t, wait2, &terr2)
+		// On reuse, submission indices start over and old errors are gone.
+		require.Equal(t, 0, terr2.Index)
+		require.ErrorIs(t, wait2, err2)
+		require.NotErrorIs(t, wait2, err1)
 	})
 }

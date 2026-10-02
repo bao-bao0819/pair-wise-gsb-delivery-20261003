@@ -54,6 +54,19 @@ func (p *ResultContextPool[T]) WithFirstError() *ResultContextPool[T] {
 	return p
 }
 
+// WithOrderedErrors configures the pool to aggregate errors in the order the
+// tasks were submitted with Go(), rather than the order in which they
+// happened to complete. Each error in the aggregated error is wrapped in a
+// *TaskError that records the submission index of the task that returned it,
+// so errors can be traced back to their task whether or not errored results
+// are collected (see WithCollectErrored). See (*ErrorPool).WithOrderedErrors
+// for details.
+func (p *ResultContextPool[T]) WithOrderedErrors() *ResultContextPool[T] {
+	p.panicIfInitialized()
+	p.contextPool.WithOrderedErrors()
+	return p
+}
+
 // WithCancelOnError configures the pool to cancel its context as soon as
 // any task returns an error. By default, the pool's context is not
 // canceled until the parent context is canceled.
