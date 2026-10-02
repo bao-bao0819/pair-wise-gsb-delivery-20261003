@@ -24,6 +24,26 @@ The example below shows how multiple-choise HTTP header value could be parsed wi
 	// Output: [{foo map[bar:1]} {baz map[]}] true
 ```
 
+The ordered parameter view keeps every parameter occurrence (it does not fold
+same names) and distinguishes a bare parameter, an empty quoted value and a
+regular token value. It also offers explicit single-value projections:
+
+```go
+	options, ok := httphead.ParseViewOptions(
+		[]byte(`foo;a=1;a=2;b="";c`),
+		httphead.ParseConfig{},
+	)
+	// Detect conflicting duplicate parameters.
+	single, err := options[0].Params.Project(httphead.ProjectOptions{
+		Duplicate: httphead.DuplicateReject, // or DuplicateFirst / DuplicateLast
+		FoldName:  true,
+	})
+	// options[0].Params.All() reports ParamBare, ParamEmpty or ParamToken for
+	// each occurrence in parse order.
+	_ = ok
+	_ = single
+```
+
 The low-level example below shows how to optimize keys skipping and selection
 of some key:
 

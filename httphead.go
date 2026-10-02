@@ -193,6 +193,14 @@ const (
 //
 // It returns false if data is malformed.
 func ScanOptions(data []byte, it func(index int, option, attribute, value []byte) Control) bool {
+	return scanOptions(data, func(index int, option, attribute, value []byte, _ bool) Control {
+		return it(index, option, attribute, value)
+	})
+}
+
+// scanOptions is the ScanOptions core that additionally reports whether the
+// parameter value was a quoted-string.
+func scanOptions(data []byte, it func(index int, option, attribute, value []byte, quoted bool) Control) bool {
 	lexer := &Scanner{data: data}
 
 	var ok bool
@@ -209,6 +217,7 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 		index             int
 		key, param, value []byte
 		mustCall          bool
+		quoted            bool
 	)
 	for lexer.Next() {
 		var (
@@ -232,6 +241,7 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 				mustCall = true
 			case stateParamValue:
 				value = v
+				quoted = false
 				state = stateParamBeforeName
 				call = true
 			default:
@@ -243,6 +253,7 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 				return false
 			}
 			value = v
+			quoted = true
 			state = stateParamBeforeName
 			call = true
 
@@ -288,7 +299,7 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 		}
 
 		if call {
-			switch it(index, key, param, value) {
+			switch it(index, key, param, value, quoted) {
 			case ControlBreak:
 				// User want to stop to parsing parameters.
 				return true
@@ -308,13 +319,14 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 			ok = true
 			param = nil
 			value = nil
+			quoted = false
 			mustCall = false
 			index += growIndex
 		}
 	}
 	if mustCall {
 		ok = true
-		it(index, key, param, value)
+		it(index, key, param, value, quoted)
 	}
 
 	return ok && !lexer.err
