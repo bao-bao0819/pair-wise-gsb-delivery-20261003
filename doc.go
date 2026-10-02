@@ -19,6 +19,12 @@
 // your program. For this reason, it is in a separate go module contained within
 // this repository.
 //
+// Cache (and the lower-level simplelru.LRU) also supports ordered snapshots
+// via Snapshot and atomic rebuilds via Restore. Snapshots are ordered oldest
+// to newest without changing recency, and Restore validates for duplicate
+// keys, drops the oldest surplus entries when the snapshot exceeds capacity,
+// and fires the eviction callback for entries removed from the replaced cache.
+//
 // All caches in this package take locks while operating, and are therefore
 // thread-safe for consumers.
 package lru

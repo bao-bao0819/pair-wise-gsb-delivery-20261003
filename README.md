@@ -77,3 +77,33 @@ func main() {
 	// Cache len: 1
 }
 ```
+
+Ordered snapshots and restore
+=============================
+
+Rebuilding a cache (for example after persistence or a restart) often needs
+to preserve recency order. Reading each value back with `Get` would rewrite
+that order as a side effect. `Snapshot` and `Restore` provide an ordered view
+and a matching restore without touching recency:
+
+```go
+// Snapshot entries are ordered oldest to newest and do not change recent-ness.
+entries := l.Snapshot()
+
+// entries is plain caller-owned data; serialize it in any format you like.
+
+// Restore validates the slice first (duplicate keys are rejected with an error
+// wrapping lru.ErrDuplicateKey and the old cache is left untouched) and then
+// replaces the cache contents atomically. If there are more entries than the
+// capacity, the oldest surplus entries are dropped.
+if err := l.Restore(entries); err != nil {
+	log.Fatal(err)
+}
+```
+
+The snapshot data is held by the caller: the library never binds it to a file
+format. Values are shallow-copied, so for pointer, slice, or map values the
+snapshot and the cache alias the same underlying value; deep copy yourself if
+you need isolation. Replacing a populated cache fires the eviction callback
+for every removed entry, as with `Purge`; entries dropped for exceeding the
+capacity were never stored and do not fire it.
