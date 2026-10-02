@@ -2,6 +2,7 @@ package secure
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -34,6 +35,52 @@ const (
 	ctxDefaultSecureHeaderKey    = secureCtxKey("SecureResponseHeader")
 	cspNonceSize                 = 16
 )
+
+// Action describes what the middleware decided should happen to a request.
+type Action int
+
+const (
+	// ActionAllow means the request may proceed to the next handler.
+	ActionAllow Action = iota
+	// ActionDeny means the request was rejected and the bad host or bad request handler must be called.
+	ActionDeny
+	// ActionRedirect means the request must be redirected (typically to HTTPS).
+	ActionRedirect
+)
+
+// Decision is the pure evaluation result for a request. It does not depend on a
+// http.ResponseWriter and never writes anything itself. Use ApplyDecision to
+// realize the decision on an actual ResponseWriter.
+type Decision struct {
+	// Action is the decision taken for the request.
+	Action Action
+
+	// Request is the (possibly modified) request that should be passed down the
+	// handler chain. It carries the CSP nonce in its context when one is
+	// required, but otherwise leaves the incoming request untouched.
+	Request *http.Request
+
+	// Header holds the headers that must be set on the response. It is only
+	// populated for ActionAllow.
+	Header http.Header
+
+	// Nonce holds the generated CSP nonce for the request, if one is required.
+	// It is generated once during evaluation and reused by ApplyDecision.
+	Nonce string
+
+	// RedirectURL is the target of the redirect. Only set for ActionRedirect.
+	RedirectURL string
+
+	// RedirectStatus is the status code of the redirect. Only set for ActionRedirect.
+	RedirectStatus int
+
+	// Reason explains why the request was denied or redirected. It is empty
+	// for ActionAllow and is also returned as the error by ApplyDecision.
+	Reason string
+
+	// denyHandler is the handler that must serve the response for ActionDeny.
+	denyHandler http.Handler
+}
 
 // SSLHostFunc is a custom function type that can be used to dynamically set the SSL host of a request.
 type SSLHostFunc func(host string) (newHost string)
@@ -200,17 +247,14 @@ func (s *Secure) SetBadRequestHandler(handler http.Handler) {
 // Handler implements the http.HandlerFunc for integration with the standard net/http lib.
 func (s *Secure) Handler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Let secure process the request. If it returns an error,
-		// that indicates the request should not continue.
-		responseHeader, r, err := s.processRequest(w, r)
-		addResponseHeaders(responseHeader, w)
-
-		// If there was an error, do not continue.
-		if err != nil {
+		// Let secure evaluate the request. If the decision is not allowed,
+		// do not continue.
+		decision := s.EvaluateRequest(r)
+		if s.applyDecision(w, decision) != nil {
 			return
 		}
 
-		h.ServeHTTP(w, r)
+		h.ServeHTTP(w, decision.Request)
 	})
 }
 
@@ -218,48 +262,47 @@ func (s *Secure) Handler(h http.Handler) http.Handler {
 // Note that this is for requests only and will not write any headers.
 func (s *Secure) HandlerForRequestOnly(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Let secure process the request. If it returns an error,
+		// Let secure evaluate the request. If the decision is not allowed,
 		// that indicates the request should not continue.
-		responseHeader, r, err := s.processRequest(w, r)
-		if err != nil {
+		decision := s.EvaluateRequest(r)
+		if decision.Action != ActionAllow {
 			return
 		}
 
 		// Save response headers in the request context.
-		ctx := context.WithValue(r.Context(), s.ctxSecureHeaderKey, responseHeader)
+		ctx := context.WithValue(decision.Request.Context(), s.ctxSecureHeaderKey, decision.Header)
 
 		// No headers will be written to the ResponseWriter.
-		h.ServeHTTP(w, r.WithContext(ctx))
+		h.ServeHTTP(w, decision.Request.WithContext(ctx))
 	})
 }
 
 // HandlerFuncWithNext is a special implementation for Negroni, but could be used elsewhere.
 func (s *Secure) HandlerFuncWithNext(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
-	// Let secure process the request. If it returns an error,
-	// that indicates the request should not continue.
-	responseHeader, r, err := s.processRequest(w, r)
-	addResponseHeaders(responseHeader, w)
+	// Let secure evaluate the request. If the decision is not allowed,
+	// do not call next.
+	decision := s.EvaluateRequest(r)
+	err := s.applyDecision(w, decision)
 
-	// If there was an error, do not call next.
 	if err == nil && next != nil {
-		next(w, r)
+		next(w, decision.Request)
 	}
 }
 
 // HandlerFuncWithNextForRequestOnly is a special implementation for Negroni, but could be used elsewhere.
 // Note that this is for requests only and will not write any headers.
 func (s *Secure) HandlerFuncWithNextForRequestOnly(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
-	// Let secure process the request. If it returns an error,
+	// Let secure evaluate the request. If the decision is not allowed,
 	// that indicates the request should not continue.
-	responseHeader, r, err := s.processRequest(w, r)
+	decision := s.EvaluateRequest(r)
 
-	// If there was an error, do not call next.
-	if err == nil && next != nil {
+	// If the request is not allowed, do not call next.
+	if decision.Action == ActionAllow && next != nil {
 		// Save response headers in the request context
-		ctx := context.WithValue(r.Context(), s.ctxSecureHeaderKey, responseHeader)
+		ctx := context.WithValue(decision.Request.Context(), s.ctxSecureHeaderKey, decision.Header)
 
 		// No headers will be written to the ResponseWriter.
-		next(w, r.WithContext(ctx))
+		next(w, decision.Request.WithContext(ctx))
 	}
 }
 
@@ -274,32 +317,41 @@ func addResponseHeaders(responseHeader http.Header, w http.ResponseWriter) {
 
 // Process runs the actual checks and writes the headers in the ResponseWriter.
 func (s *Secure) Process(w http.ResponseWriter, r *http.Request) error {
-	responseHeader, _, err := s.processRequest(w, r)
-	addResponseHeaders(responseHeader, w)
-
-	return err
+	return s.applyDecision(w, s.EvaluateRequest(r))
 }
 
 // ProcessAndReturnNonce runs the actual checks and writes the headers in the ResponseWriter.
 // In addition, the generated nonce for the request is returned as well as the error value.
 func (s *Secure) ProcessAndReturnNonce(w http.ResponseWriter, r *http.Request) (string, error) {
-	responseHeader, newR, err := s.processRequest(w, r)
-	if err != nil {
+	decision := s.EvaluateRequest(r)
+	if err := s.applyDecision(w, decision); err != nil {
 		return "", err
 	}
 
-	addResponseHeaders(responseHeader, w)
-
-	return CSPNonce(newR.Context()), err
+	return decision.Nonce, nil
 }
 
 // ProcessNoModifyRequest runs the actual checks but does not write the headers in the ResponseWriter.
 func (s *Secure) ProcessNoModifyRequest(w http.ResponseWriter, r *http.Request) (http.Header, *http.Request, error) {
-	return s.processRequest(w, r)
+	decision := s.EvaluateRequest(r)
+
+	if decision.Action != ActionAllow {
+		return nil, nil, s.applyDecision(w, decision)
+	}
+
+	return decision.Header, decision.Request, nil
 }
 
-// processRequest runs the actual checks on the request and returns an error if the middleware chain should stop.
-func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.Header, *http.Request, error) {
+// EvaluateRequest runs the actual checks on the request without touching any
+// http.ResponseWriter. It never calls the bad host or bad request handlers and
+// never modifies the incoming request (in particular, it never mutates
+// r.URL); the result of the evaluation, including the headers to add, the
+// redirect target and the reason for a denial, is returned as a Decision.
+//
+// When a CSP nonce is required, it is generated once and stored in the
+// Decision. Applying the same Decision reuses that nonce instead of
+// generating a new one.
+func (s *Secure) EvaluateRequest(r *http.Request) *Decision {
 	// Setup nonce if required.
 	if s.opt.nonceEnabled {
 		r = withCSPNonce(r, cspRandNonce())
@@ -339,9 +391,12 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 		}
 
 		if !isGoodHost {
-			s.badHostHandler.ServeHTTP(w, r)
-
-			return nil, nil, fmt.Errorf("bad host name: %s", host)
+			return &Decision{
+				Action:      ActionDeny,
+				Request:     r,
+				Reason:      fmt.Sprintf("bad host name: %s", host),
+				denyHandler: s.badHostHandler,
+			}
 		}
 	}
 
@@ -350,7 +405,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 
 	// SSL check.
 	if s.opt.SSLRedirect && !ssl && !s.opt.IsDevelopment {
-		url := r.URL
+		url := *r.URL
 		url.Scheme = "https"
 		url.Host = host
 
@@ -367,9 +422,13 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 			status = http.StatusTemporaryRedirect
 		}
 
-		http.Redirect(w, r, url.String(), status)
-
-		return nil, nil, fmt.Errorf("redirecting to HTTPS")
+		return &Decision{
+			Action:         ActionRedirect,
+			Request:        r,
+			RedirectURL:    url.String(),
+			RedirectStatus: status,
+			Reason:         "redirecting to HTTPS",
+		}
 	}
 
 	if s.opt.SSLForceHost {
@@ -384,7 +443,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 		}
 
 		if tempSSLHost != host {
-			url := r.URL
+			url := *r.URL
 			url.Scheme = "https"
 			url.Host = tempSSLHost
 
@@ -393,17 +452,24 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 				status = http.StatusTemporaryRedirect
 			}
 
-			http.Redirect(w, r, url.String(), status)
-
-			return nil, nil, fmt.Errorf("redirecting to HTTPS")
+			return &Decision{
+				Action:         ActionRedirect,
+				Request:        r,
+				RedirectURL:    url.String(),
+				RedirectStatus: status,
+				Reason:         "redirecting to HTTPS",
+			}
 		}
 	}
 
 	// If the AllowRequestFunc is set, call it and exit early if needed.
 	if s.opt.AllowRequestFunc != nil && !s.opt.AllowRequestFunc(r) {
-		s.badRequestHandler.ServeHTTP(w, r)
-
-		return nil, nil, fmt.Errorf("request not allowed")
+		return &Decision{
+			Action:      ActionDeny,
+			Request:     r,
+			Reason:      "request not allowed",
+			denyHandler: s.badRequestHandler,
+		}
 	}
 
 	// Create our header container.
@@ -504,7 +570,43 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 		responseHeader.Set(permittedCrossDomainPolicies, s.opt.XPermittedCrossDomainPolicies)
 	}
 
-	return responseHeader, r, nil
+	return &Decision{
+		Action:  ActionAllow,
+		Request: r,
+		Header:  responseHeader,
+		Nonce:   CSPNonce(r.Context()),
+	}
+}
+
+// applyDecision realizes a Decision returned by EvaluateRequest on the
+// ResponseWriter. A denied request is served by the decision's deny handler,
+// a redirecting request triggers the configured redirect and an allowed
+// request gets the decision's headers added. The returned error is nil for
+// ActionAllow and explains the outcome otherwise.
+func (s *Secure) applyDecision(w http.ResponseWriter, decision *Decision) error {
+	switch decision.Action {
+	case ActionDeny:
+		decision.denyHandler.ServeHTTP(w, decision.Request)
+
+		return errors.New(decision.Reason)
+	case ActionRedirect:
+		http.Redirect(w, decision.Request, decision.RedirectURL, decision.RedirectStatus)
+
+		return errors.New(decision.Reason)
+	default:
+		addResponseHeaders(decision.Header, w)
+
+		return nil
+	}
+}
+
+// ApplyDecision realizes a Decision previously returned by EvaluateRequest on
+// the given ResponseWriter. It calls the bad host or bad request handler for a
+// denied request, performs the redirect for a redirecting request and adds the
+// prepared headers for an allowed request. It returns nil when the request is
+// allowed and an error explaining the decision otherwise.
+func (s *Secure) ApplyDecision(w http.ResponseWriter, decision *Decision) error {
+	return s.applyDecision(w, decision)
 }
 
 // isSSL determine if we are on HTTPS.

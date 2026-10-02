@@ -146,6 +146,27 @@ Call `secure.SetBadRequestHandler` to set your own custom handler.
 ### Allow Request Function
 Secure allows you to set a custom function (`func(r *http.Request) bool`) for the `AllowRequestFunc` option. You can use this function as a custom filter to allow the request to continue or simply reject it. This can be handy if you need to do any dynamic filtering on any of the request properties. It should be noted that this function will be called on every request, so be sure to make your checks quick and not relying on time consuming external calls (or you will be slowing down all requests). See above on how to set a custom handler for the rejected requests.
 
+### Pure request evaluation
+If you need to know what the middleware would do with a request without writing anything, use `EvaluateRequest`. It takes only the request and returns a `Decision` describing whether it would be allowed, denied or redirected, the headers that would be added, the redirect URL and status, and the reason for the outcome. It never calls the bad host or bad request handlers and never mutates the request (including its URL).
+
+Use `ApplyDecision` on a `ResponseWriter` to realize a previously computed decision. When a CSP nonce is required it is generated once, stored in the decision, and reused when the decision is applied.
+
+~~~ go
+decision := secureMiddleware.EvaluateRequest(req)
+
+switch decision.Action {
+case secure.ActionAllow:
+    // decision.Header holds the headers to add.
+case secure.ActionDeny:
+    // decision.Reason explains why the request was rejected.
+case secure.ActionRedirect:
+    // decision.RedirectURL and decision.RedirectStatus describe the redirect.
+}
+
+// Later, realize the exact same decision on a response.
+err := secureMiddleware.ApplyDecision(w, decision)
+~~~
+
 ### Redirecting HTTP to HTTPS
 If you want to redirect all HTTP requests to HTTPS, you can use the following example.
 
