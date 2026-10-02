@@ -215,6 +215,9 @@ import (
 //
 // The type must be one of DecodeHookFuncType, DecodeHookFuncKind, or
 // DecodeHookFuncValue.
+// DecodeHookFuncTypeWithContext, DecodeHookFuncKindWithContext and
+// DecodeHookFuncValueWithContext additionally receive the current path
+// context (see [DecodeHookContext]).
 // Values are a superset of Types (Values can return types), and Types are a
 // superset of Kinds (Types can return Kinds) and are generally a richer thing
 // to use, but Kinds are simpler if you only need those.
@@ -236,6 +239,168 @@ type DecodeHookFuncKind func(reflect.Kind, reflect.Kind, any) (any, error)
 // DecodeHookFuncValue is a DecodeHookFunc which has complete access to both the source and target
 // values.
 type DecodeHookFuncValue func(from reflect.Value, to reflect.Value) (any, error)
+
+// DecodeHookFuncTypeWithContext is a [DecodeHookFuncType] that additionally
+// receives a [DecodeHookContext] describing the location of the value being
+// converted inside the decoded input and the target value.
+//
+// This is useful for transformations that should only happen at a specific
+// location (for example only in the value of a field named "credentials"),
+// which is not possible with the context-free hook forms.
+type DecodeHookFuncTypeWithContext func(
+	context DecodeHookContext,
+	from reflect.Type,
+	to reflect.Type,
+	data any,
+) (any, error)
+
+// DecodeHookFuncKindWithContext is a [DecodeHookFuncKind] that additionally
+// receives a [DecodeHookContext]. See [DecodeHookFuncTypeWithContext].
+type DecodeHookFuncKindWithContext func(
+	context DecodeHookContext,
+	from reflect.Kind,
+	to reflect.Kind,
+	data any,
+) (any, error)
+
+// DecodeHookFuncValueWithContext is a [DecodeHookFuncValue] that additionally
+// receives a [DecodeHookContext]. See [DecodeHookFuncTypeWithContext].
+type DecodeHookFuncValueWithContext func(
+	context DecodeHookContext,
+	from reflect.Value,
+	to reflect.Value,
+) (any, error)
+
+// PathSegmentKind describes the kind of a [PathSegment].
+type PathSegmentKind int
+
+const (
+	// PathSegmentField is a [PathSegment] describing a struct field. The
+	// segment name is the Go field name, not the configured tag value.
+	PathSegmentField PathSegmentKind = iota + 1
+
+	// PathSegmentMapKey is a [PathSegment] describing a map key.
+	PathSegmentMapKey
+
+	// PathSegmentIndex is a [PathSegment] describing a slice or array index.
+	PathSegmentIndex
+)
+
+// String returns a human readable representation of the segment kind.
+func (k PathSegmentKind) String() string {
+	switch k {
+	case PathSegmentField:
+		return "field"
+	case PathSegmentMapKey:
+		return "map key"
+	case PathSegmentIndex:
+		return "index"
+	default:
+		return "unknown"
+	}
+}
+
+// PathSegment is a single element of a [Path].
+//
+// Every segment explicitly records its [PathSegmentKind], so arbitrary
+// strings (including names containing dots or brackets) can be represented
+// unambiguously. Paths are not built by joining strings with dots.
+//
+// Exactly one of Field, MapKey or Index holds a meaningful value,
+// depending on Kind:
+//
+//   - PathSegmentField: Field
+//   - PathSegmentMapKey: MapKey (the raw key value, typically a string)
+//   - PathSegmentIndex: Index
+type PathSegment struct {
+	// Kind is the kind of this segment.
+	Kind PathSegmentKind
+
+	// Field is the target struct field name. Only valid for PathSegmentField.
+	Field string
+
+	// MapKey is the map key value. Only valid for PathSegmentMapKey.
+	MapKey any
+
+	// Index is the slice or array index. Only valid for PathSegmentIndex.
+	Index int
+}
+
+// FieldPathSegment returns a [PathSegment] for the struct field with the
+// given name.
+func FieldPathSegment(field string) PathSegment {
+	return PathSegment{Kind: PathSegmentField, Field: field}
+}
+
+// MapKeyPathSegment returns a [PathSegment] for the given map key.
+func MapKeyPathSegment(key any) PathSegment {
+	return PathSegment{Kind: PathSegmentMapKey, MapKey: key}
+}
+
+// IndexPathSegment returns a [PathSegment] for the given slice or array
+// index.
+func IndexPathSegment(index int) PathSegment {
+	return PathSegment{Kind: PathSegmentIndex, Index: index}
+}
+
+// String returns a conventional representation of the segment, such as
+// ".Name", `["a.b"]` or "[2]". The representation is for display only;
+// use the segment fields for structured access.
+func (s PathSegment) String() string {
+	switch s.Kind {
+	case PathSegmentField:
+		return "." + s.Field
+	case PathSegmentMapKey:
+		switch key := s.MapKey.(type) {
+		case string:
+			return "[" + strconv.Quote(key) + "]"
+		default:
+			return "[" + fmt.Sprintf("%v", s.MapKey) + "]"
+		}
+	case PathSegmentIndex:
+		return "[" + strconv.Itoa(s.Index) + "]"
+	default:
+		return ""
+	}
+}
+
+// Path is the structured location of a value inside the decoded input or
+// the target value. The empty path identifies the root value.
+type Path []PathSegment
+
+// String renders the path in a conventional form, for example
+// `.Users["a.b"].Addresses[0]`. The result is for display only; inspect
+// the [PathSegment] values for structured access.
+func (p Path) String() string {
+	var builder strings.Builder
+	for _, segment := range p {
+		builder.WriteString(segment.String())
+	}
+	return builder.String()
+}
+
+// DecodeHookContext carries location information for context-aware decode
+// hooks (the DecodeHookFunc*WithContext types).
+//
+// The slices, if any, are copies owned by the hook invocation. Hooks may
+// read them freely but must not rely on them after the hook returns, since
+// the decoder reuses path storage across a single decode.
+type DecodeHookContext struct {
+	// InputPath is the location of the value being converted in the input
+	// data. It is empty for the root value.
+	InputPath Path
+
+	// TargetPath is the location of the value being populated in the target.
+	// Struct field segments use the Go field name. It is empty for the root
+	// value.
+	TargetPath Path
+
+	// ConvertingMapKey reports whether the hook is converting a map key
+	// rather than a map value (or any other value). While true, the last
+	// segment of the paths identifies the map entry whose key is being
+	// converted.
+	ConvertingMapKey bool
+}
 
 // Unmarshaler is the interface implemented by types that can unmarshal
 // themselves. UnmarshalMapstructure receives the input data (potentially
@@ -385,7 +550,16 @@ type DecoderConfig struct {
 // up the most basic Decoder.
 type Decoder struct {
 	config           *DecoderConfig
-	cachedDecodeHook func(from reflect.Value, to reflect.Value) (any, error)
+	cachedDecodeHook cachedDecodeHookFunc
+
+	// inputPath and targetPath are the structured locations passed to
+	// context-aware decode hooks. They are grown and shrunk by decodeChild
+	// while descending into the input. A Decode call always restores them
+	// to their previous state, so nested Decode calls (including reentrant
+	// calls into the same Decoder) cannot corrupt the outer path context.
+	inputPath        Path
+	targetPath       Path
+	convertingMapKey bool
 }
 
 // Metadata contains information about decoding a structure that
@@ -530,6 +704,19 @@ func NewDecoder(config *DecoderConfig) (*Decoder, error) {
 // Decode decodes the given raw interface to the target pointer specified
 // by the configuration.
 func (d *Decoder) Decode(input any) error {
+	// Snapshot and reset the path state. A Decode call must always restore
+	// it, so nested (even reentrant) Decode calls can't corrupt the path
+	// context of the outer decode.
+	savedInputPath, savedTargetPath := d.inputPath, d.targetPath
+	savedConvertingMapKey := d.convertingMapKey
+	d.inputPath, d.targetPath = nil, nil
+	d.convertingMapKey = false
+	defer func() {
+		d.inputPath = savedInputPath
+		d.targetPath = savedTargetPath
+		d.convertingMapKey = savedConvertingMapKey
+	}()
+
 	err := d.decode(d.config.RootName, input, reflect.ValueOf(d.config.Result).Elem())
 
 	// Retain some of the original behavior when multiple errors ocurr
@@ -539,6 +726,54 @@ func (d *Decoder) Decode(input any) error {
 	}
 
 	return err
+}
+
+// decodeChild descends from the current value to a nested value, extending
+// the structured paths for context-aware hooks for the duration of the
+// recursive decode. A nil segment leaves the corresponding path unchanged.
+//
+// When converting a map key, convertingMapKey is set to true for the whole
+// recursive decode (including any hooks the key conversion itself triggers)
+// and restored afterwards.
+func (d *Decoder) decodeChild(
+	name string,
+	input any,
+	outVal reflect.Value,
+	inputSegment, targetSegment *PathSegment,
+	convertingMapKey bool,
+) error {
+	if inputSegment != nil {
+		d.inputPath = append(d.inputPath, *inputSegment)
+		defer func() {
+			d.inputPath = d.inputPath[:len(d.inputPath)-1]
+		}()
+	}
+	if targetSegment != nil {
+		d.targetPath = append(d.targetPath, *targetSegment)
+		defer func() {
+			d.targetPath = d.targetPath[:len(d.targetPath)-1]
+		}()
+	}
+	if convertingMapKey {
+		previous := d.convertingMapKey
+		d.convertingMapKey = true
+		defer func() {
+			d.convertingMapKey = previous
+		}()
+	}
+
+	return d.decode(name, input, outVal)
+}
+
+// hookContext returns the current [DecodeHookContext]. Every slice is
+// copied so a hook can't mutate decoder state by retaining or modifying
+// the path slices.
+func (d *Decoder) hookContext() DecodeHookContext {
+	return DecodeHookContext{
+		InputPath:        append(Path(nil), d.inputPath...),
+		TargetPath:       append(Path(nil), d.targetPath...),
+		ConvertingMapKey: d.convertingMapKey,
+	}
 }
 
 // isNil returns true if the input is nil or a typed nil pointer.
@@ -601,7 +836,7 @@ func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
 	if d.cachedDecodeHook != nil {
 		// We have a DecodeHook, so let's pre-process the input.
 		var err error
-		input, err = d.cachedDecodeHook(inputVal, outVal)
+		input, err = d.cachedDecodeHook(d.hookContext(), inputVal, outVal)
 		if err != nil {
 			return newDecodeError(name, err)
 		}
@@ -1066,9 +1301,11 @@ func (d *Decoder) decodeMapFromSlice(name string, dataVal reflect.Value, val ref
 	}
 
 	for i := 0; i < dataVal.Len(); i++ {
-		err := d.decode(
+		inputSegment := IndexPathSegment(i)
+		err := d.decodeChild(
 			name+"["+strconv.Itoa(i)+"]",
-			dataVal.Index(i).Interface(), val)
+			dataVal.Index(i).Interface(), val,
+			&inputSegment, nil, false)
 		if err != nil {
 			return err
 		}
@@ -1101,10 +1338,17 @@ func (d *Decoder) decodeMapFromMap(name string, dataVal reflect.Value, val refle
 
 	for _, k := range dataVal.MapKeys() {
 		fieldName := name + "[" + k.String() + "]"
+		inputKeySegment := MapKeyPathSegment(k.Interface())
+		// While the key is being converted the target key doesn't exist yet,
+		// so the target path identifies the entry using its source key; the
+		// ConvertingMapKey flag disambiguates the situation.
+		targetKeySegment := MapKeyPathSegment(k.Interface())
 
 		// First decode the key into the proper type
 		currentKey := reflect.Indirect(reflect.New(valKeyType))
-		if err := d.decode(fieldName, k.Interface(), currentKey); err != nil {
+		if err := d.decodeChild(
+			fieldName, k.Interface(), currentKey,
+			&inputKeySegment, &targetKeySegment, true); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -1112,7 +1356,11 @@ func (d *Decoder) decodeMapFromMap(name string, dataVal reflect.Value, val refle
 		// Next decode the data into the proper type
 		v := dataVal.MapIndex(k).Interface()
 		currentVal := reflect.Indirect(reflect.New(valElemType))
-		if err := d.decode(fieldName, v, currentVal); err != nil {
+		valueInputSegment := MapKeyPathSegment(k.Interface())
+		valueTargetSegment := MapKeyPathSegment(currentKey.Interface())
+		if err := d.decodeChild(
+			fieldName, v, currentVal,
+			&valueInputSegment, &valueTargetSegment, false); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -1239,7 +1487,11 @@ func (d *Decoder) decodeMapFromStruct(name string, dataVal reflect.Value, val re
 			addrVal := reflect.New(vMap.Type())
 			reflect.Indirect(addrVal).Set(vMap)
 
-			err := d.decode(keyName, x.Interface(), reflect.Indirect(addrVal))
+			inputSegment := FieldPathSegment(f.Name)
+			targetSegment := MapKeyPathSegment(keyName)
+			err := d.decodeChild(
+				keyName, x.Interface(), reflect.Indirect(addrVal),
+				&inputSegment, &targetSegment, false)
 			if err != nil {
 				return err
 			}
@@ -1275,7 +1527,11 @@ func (d *Decoder) decodeMapFromStruct(name string, dataVal reflect.Value, val re
 				if v.Len() > 0 {
 					reflect.Indirect(addrVal).Set(vSlice)
 
-					err := d.decode(keyName, v.Interface(), reflect.Indirect(addrVal))
+					inputSegment := FieldPathSegment(f.Name)
+					targetSegment := MapKeyPathSegment(keyName)
+					err := d.decodeChild(
+						keyName, v.Interface(), reflect.Indirect(addrVal),
+						&inputSegment, &targetSegment, false)
 					if err != nil {
 						return err
 					}
@@ -1427,7 +1683,11 @@ func (d *Decoder) decodeSlice(name string, data any, val reflect.Value) error {
 		currentField := valSlice.Index(i)
 
 		fieldName := name + "[" + strconv.Itoa(i) + "]"
-		if err := d.decode(fieldName, currentData, currentField); err != nil {
+		inputSegment := IndexPathSegment(i)
+		targetSegment := IndexPathSegment(i)
+		if err := d.decodeChild(
+			fieldName, currentData, currentField,
+			&inputSegment, &targetSegment, false); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1488,7 +1748,11 @@ func (d *Decoder) decodeArray(name string, data any, val reflect.Value) error {
 		currentField := valArray.Index(i)
 
 		fieldName := name + "[" + strconv.Itoa(i) + "]"
-		if err := d.decode(fieldName, currentData, currentField); err != nil {
+		inputSegment := IndexPathSegment(i)
+		targetSegment := IndexPathSegment(i)
+		if err := d.decodeChild(
+			fieldName, currentData, currentField,
+			&inputSegment, &targetSegment, false); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1718,7 +1982,11 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			fieldName = name + "." + fieldName
 		}
 
-		if err := d.decode(fieldName, rawMapVal.Interface(), fieldValue); err != nil {
+		inputSegment := MapKeyPathSegment(rawMapKey.Interface())
+		targetSegment := FieldPathSegment(field.Name)
+		if err := d.decodeChild(
+			fieldName, rawMapVal.Interface(), fieldValue,
+			&inputSegment, &targetSegment, false); err != nil {
 			errs = append(errs, err)
 		}
 	}

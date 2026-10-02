@@ -410,3 +410,57 @@ func ExampleDecode_unmarshaler() {
 	// Output:
 	// Host: example.com, Port: 8080
 }
+
+func ExampleDecodeHookFuncTypeWithContext() {
+	// Context-aware hooks receive the structured location of the value
+	// being converted, so transformations can be restricted to e.g. values
+	// below a "credentials" field.
+	type Credentials struct {
+		Token string
+	}
+	type Config struct {
+		Name        string
+		Credentials Credentials
+	}
+
+	hook := func(
+		context DecodeHookContext,
+		from reflect.Type,
+		to reflect.Type,
+		data any,
+	) (any, error) {
+		if from.Kind() != reflect.String || to.Kind() != reflect.String {
+			return data, nil
+		}
+		if len(context.TargetPath) > 0 &&
+			context.TargetPath[0].Kind == PathSegmentField &&
+			context.TargetPath[0].Field == "Credentials" {
+			return strings.ToUpper(data.(string)), nil
+		}
+		return data, nil
+	}
+
+	var result Config
+	decoder, err := NewDecoder(&DecoderConfig{
+		Result:     &result,
+		DecodeHook: DecodeHookFuncTypeWithContext(hook),
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	err = decoder.Decode(map[string]any{
+		"name": "alice",
+		"credentials": map[string]any{
+			"token": "s3cr3t",
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Name: %s, Token: %s", result.Name, result.Credentials.Token)
+
+	// Output:
+	// Name: alice, Token: S3CR3T
+}

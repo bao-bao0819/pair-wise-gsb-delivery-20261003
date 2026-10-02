@@ -29,10 +29,13 @@ func typedDecodeHook(h DecodeHookFunc) DecodeHookFunc {
 	var f1 DecodeHookFuncType
 	var f2 DecodeHookFuncKind
 	var f3 DecodeHookFuncValue
+	var f4 DecodeHookFuncTypeWithContext
+	var f5 DecodeHookFuncKindWithContext
+	var f6 DecodeHookFuncValueWithContext
 
 	// Fill in the variables into this interface and the rest is done
 	// automatically using the reflect package.
-	potential := []any{f1, f2, f3}
+	potential := []any{f1, f2, f3, f4, f5, f6}
 
 	v := reflect.ValueOf(h)
 	vt := v.Type()
@@ -46,31 +49,57 @@ func typedDecodeHook(h DecodeHookFunc) DecodeHookFunc {
 	return nil
 }
 
+// cachedDecodeHookFunc is a decode hook with its current [DecodeHookContext]
+// already resolved by the decoder. Context-free hook forms simply ignore it.
+type cachedDecodeHookFunc func(
+	context DecodeHookContext,
+	from reflect.Value,
+	to reflect.Value,
+) (any, error)
+
 // cachedDecodeHook takes a raw DecodeHookFunc (an any) and turns
 // it into a closure to be used directly
 // if the type fails to convert we return a closure always erroring to keep the previous behaviour
-func cachedDecodeHook(raw DecodeHookFunc) func(from reflect.Value, to reflect.Value) (any, error) {
+func cachedDecodeHook(raw DecodeHookFunc) cachedDecodeHookFunc {
 	switch f := typedDecodeHook(raw).(type) {
 	case DecodeHookFuncType:
-		return func(from reflect.Value, to reflect.Value) (any, error) {
+		return func(_ DecodeHookContext, from reflect.Value, to reflect.Value) (any, error) {
 			if !from.IsValid() {
 				return f(reflect.TypeOf((*any)(nil)).Elem(), to.Type(), nil)
 			}
 			return f(from.Type(), to.Type(), from.Interface())
 		}
 	case DecodeHookFuncKind:
-		return func(from reflect.Value, to reflect.Value) (any, error) {
+		return func(_ DecodeHookContext, from reflect.Value, to reflect.Value) (any, error) {
 			if !from.IsValid() {
 				return f(reflect.Invalid, to.Kind(), nil)
 			}
 			return f(from.Kind(), to.Kind(), from.Interface())
 		}
 	case DecodeHookFuncValue:
-		return func(from reflect.Value, to reflect.Value) (any, error) {
+		return func(_ DecodeHookContext, from reflect.Value, to reflect.Value) (any, error) {
 			return f(from, to)
 		}
+	case DecodeHookFuncTypeWithContext:
+		return func(context DecodeHookContext, from reflect.Value, to reflect.Value) (any, error) {
+			if !from.IsValid() {
+				return f(context, reflect.TypeOf((*any)(nil)).Elem(), to.Type(), nil)
+			}
+			return f(context, from.Type(), to.Type(), from.Interface())
+		}
+	case DecodeHookFuncKindWithContext:
+		return func(context DecodeHookContext, from reflect.Value, to reflect.Value) (any, error) {
+			if !from.IsValid() {
+				return f(context, reflect.Invalid, to.Kind(), nil)
+			}
+			return f(context, from.Kind(), to.Kind(), from.Interface())
+		}
+	case DecodeHookFuncValueWithContext:
+		return func(context DecodeHookContext, from reflect.Value, to reflect.Value) (any, error) {
+			return f(context, from, to)
+		}
 	default:
-		return func(from reflect.Value, to reflect.Value) (any, error) {
+		return func(DecodeHookContext, reflect.Value, reflect.Value) (any, error) {
 			return nil, errors.New("invalid decode hook signature")
 		}
 	}
@@ -80,6 +109,18 @@ func cachedDecodeHook(raw DecodeHookFunc) func(from reflect.Value, to reflect.Va
 // since it'll naturally degrade to the older backwards compatible DecodeHookFunc
 // that took reflect.Kind instead of reflect.Type.
 func DecodeHookExec(
+	raw DecodeHookFunc,
+	from reflect.Value, to reflect.Value,
+) (any, error) {
+	return DecodeHookExecWithContext(DecodeHookContext{}, raw, from, to)
+}
+
+// DecodeHookExecWithContext executes the given decode hook with the provided
+// [DecodeHookContext]. It behaves like [DecodeHookExec] but also supports
+// the context-aware hook forms; the context is ignored by context-free
+// hooks.
+func DecodeHookExecWithContext(
+	context DecodeHookContext,
 	raw DecodeHookFunc,
 	from reflect.Value, to reflect.Value,
 ) (any, error) {
@@ -96,6 +137,18 @@ func DecodeHookExec(
 		return f(from.Kind(), to.Kind(), from.Interface())
 	case DecodeHookFuncValue:
 		return f(from, to)
+	case DecodeHookFuncTypeWithContext:
+		if !from.IsValid() {
+			return f(context, reflect.TypeOf((*any)(nil)).Elem(), to.Type(), nil)
+		}
+		return f(context, from.Type(), to.Type(), from.Interface())
+	case DecodeHookFuncKindWithContext:
+		if !from.IsValid() {
+			return f(context, reflect.Invalid, to.Kind(), nil)
+		}
+		return f(context, from.Kind(), to.Kind(), from.Interface())
+	case DecodeHookFuncValueWithContext:
+		return f(context, from, to)
 	default:
 		return nil, errors.New("invalid decode hook signature")
 	}
@@ -106,18 +159,22 @@ func DecodeHookExec(
 //
 // The composed funcs are called in order, with the result of the
 // previous transformation.
+//
+// Hook context is transparent to composition: every composed hook
+// receives the same [DecodeHookContext] as the composed hook. Context-free
+// and context-aware hooks can be mixed freely.
 func ComposeDecodeHookFunc(fs ...DecodeHookFunc) DecodeHookFunc {
-	cached := make([]func(from reflect.Value, to reflect.Value) (any, error), 0, len(fs))
+	cached := make([]cachedDecodeHookFunc, 0, len(fs))
 	for _, f := range fs {
 		cached = append(cached, cachedDecodeHook(f))
 	}
-	return func(f reflect.Value, t reflect.Value) (any, error) {
+	return func(context DecodeHookContext, f reflect.Value, t reflect.Value) (any, error) {
 		var err error
 		data := safeInterface(f)
 
 		newFrom := f
 		for _, c := range cached {
-			data, err = c(newFrom, t)
+			data, err = c(context, newFrom, t)
 			if err != nil {
 				return nil, err
 			}
@@ -138,17 +195,17 @@ func ComposeDecodeHookFunc(fs ...DecodeHookFunc) DecodeHookFunc {
 // OrComposeDecodeHookFunc executes all input hook functions until one of them returns no error. In that case its value is returned.
 // If all hooks return an error, OrComposeDecodeHookFunc returns an error concatenating all error messages.
 func OrComposeDecodeHookFunc(ff ...DecodeHookFunc) DecodeHookFunc {
-	cached := make([]func(from reflect.Value, to reflect.Value) (any, error), 0, len(ff))
+	cached := make([]cachedDecodeHookFunc, 0, len(ff))
 	for _, f := range ff {
 		cached = append(cached, cachedDecodeHook(f))
 	}
-	return func(a, b reflect.Value) (any, error) {
+	return func(context DecodeHookContext, a, b reflect.Value) (any, error) {
 		var allErrs string
 		var out any
 		var err error
 
 		for _, c := range cached {
-			out, err = c(a, b)
+			out, err = c(context, a, b)
 			if err != nil {
 				allErrs += err.Error() + "\n"
 				continue
