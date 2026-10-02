@@ -6,6 +6,11 @@
 // packets to encode with the New* constructors and serialize them with
 // [Packet.Bytes].
 //
+// The package also offers an opt-in DER validation mode that does not affect
+// ordinary BER decoding: [DecodePacketDER] / [ReadPacketDER] reject any input
+// that is not canonical DER for the supported types, and [CheckDER] reports the
+// offset and tree path of the first violation without decoding.
+//
 // The decoder is written to accept untrusted input: the [MaxPacketLengthBytes]
 // and [MaxNestingDepth] package variables bound allocation and recursion. Prefer
 // [DecodePacketErr] over [DecodePacket], which reports failure only by returning

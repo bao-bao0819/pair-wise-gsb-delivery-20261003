@@ -10,6 +10,13 @@ All notable changes to this project are documented here. The format is based on
 - `NewIntegerErr`, `NewRealErr`, `NewOIDErr`, and `NewRelativeOIDErr`:
   error-returning variants of the existing constructors that report invalid
   input instead of panicking or returning `nil`.
+- Opt-in DER validation: `CheckDER`, `DecodePacketDER`, and `ReadPacketDER`
+  verify canonical DER on the original bytes and return a `DERError` giving
+  the offset and tree path of the first violation. Coverage is limited to the
+  supported types (BOOLEAN, INTEGER, NULL, OBJECT IDENTIFIER/RELATIVE-OID,
+  strings, OCTET STRING, SEQUENCE); SET/SET OF report `ErrUnsupportedStrictType`
+  because their ordering is type-dependent. Ordinary BER decoding is
+  unchanged.
 
 ### Changed
 

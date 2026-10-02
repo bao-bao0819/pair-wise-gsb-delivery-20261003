@@ -52,6 +52,33 @@ recursion.
 See the [reference documentation](https://pkg.go.dev/github.com/go-asn1-ber/asn1-ber)
 for the full API.
 
+## DER validation
+
+BER tolerates several non-canonical encodings. To require DER (the canonical
+subset of BER) without changing how the ordinary decoder behaves, use the
+explicit DER functions:
+
+```go
+// Validate without decoding; the *ber.DERError pinpoints the first violation.
+if err := ber.CheckDER(data); err != nil {
+    var derr *ber.DERError
+    if errors.As(err, &derr) {
+        log.Fatalf("not DER at byte %d (%s): %v", derr.Offset, derr.Path, derr)
+    }
+}
+
+// Or validate and decode in one call; a valid input yields the same Packet as
+// DecodePacketErr.
+packet, err := ber.DecodePacketDER(data)
+```
+
+Checks are scoped to the types the library supports — BOOLEAN, INTEGER, NULL,
+OBJECT IDENTIFIER, the character strings, OCTET STRING, and SEQUENCE — and
+cover minimal tag/length encoding, definite length, integer sign padding, and
+the canonical boolean value. SET/SET OF return an error wrapping
+`ber.ErrUnsupportedStrictType`, since their ordering needs type information;
+this is deliberately not presented as complete DER.
+
 ## Development
 
 ```sh
