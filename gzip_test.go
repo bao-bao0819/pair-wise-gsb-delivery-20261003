@@ -671,3 +671,171 @@ func newTestHandler(body string) http.Handler {
 		}
 	}))
 }
+
+func mustWrap(t *testing.T, opts ...option) func(http.Handler) http.Handler {
+	wrapper, err := GzipHandlerWithOpts(opts...)
+	assert.NoError(t, err)
+	return wrapper
+}
+
+// serveETagRequest runs a request carrying "Accept-Encoding: gzip" through a
+// handler configured with the given options, where the inner handler sets up
+// headers via setup and then writes body (unless it is empty).
+func serveETagRequest(t *testing.T, method string, opts []option, setup func(http.ResponseWriter), body string) *httptest.ResponseRecorder {
+	handler := mustWrap(t, opts...)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if setup != nil {
+			setup(w)
+		}
+		if body != "" {
+			io.WriteString(w, body)
+		}
+	}))
+
+	req, _ := http.NewRequest(method, "/whatever", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func setETag(tag string) func(http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		w.Header().Set("ETag", tag)
+	}
+}
+
+func TestETagWeakenOnCompressedResponse(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(http.ResponseWriter)
+		wantETag string
+	}{
+		{"strong tag is weakened", setETag(`"v1"`), `W/"v1"`},
+		{"weak tag is not prefixed twice", setETag(`W/"v1"`), `W/"v1"`},
+		{"empty opaque tag is weakened", setETag(`""`), `W/""`},
+		{"invalid tag is removed", setETag(`not-an-etag`), ""},
+		{"unquoted tag is removed", setETag(`v1`), ""},
+		{"lowercase weak prefix is invalid and removed", setETag(`w/"v1"`), ""},
+		{"multiple values are removed", func(w http.ResponseWriter) {
+			w.Header().Add("ETag", `"v1"`)
+			w.Header().Add("ETag", `"v2"`)
+		}, ""},
+		{"no tag stays absent", nil, ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := serveETagRequest(t, "GET", []option{WeakenETag()}, tc.setup, testBody)
+			res := resp.Result()
+
+			assert.Equal(t, "gzip", res.Header.Get("Content-Encoding"))
+			assert.Equal(t, tc.wantETag, res.Header.Get("ETag"))
+		})
+	}
+}
+
+func TestETagRemoveOnCompressedResponse(t *testing.T) {
+	resp := serveETagRequest(t, "GET", []option{RemoveETag()}, setETag(`"v1"`), testBody)
+	res := resp.Result()
+
+	assert.Equal(t, "gzip", res.Header.Get("Content-Encoding"))
+	assert.Equal(t, "", res.Header.Get("ETag"))
+	_, ok := res.Header["Etag"]
+	assert.False(t, ok, "ETag header should have been deleted")
+}
+
+func TestETagFuncOnCompressedResponse(t *testing.T) {
+	var gotETag, gotEncoding string
+	called := false
+	opt := ETagFunc(func(origETag, encoding string) string {
+		called = true
+		gotETag, gotEncoding = origETag, encoding
+		return origETag + "-" + encoding
+	})
+
+	resp := serveETagRequest(t, "GET", []option{opt}, setETag(`"v1"`), testBody)
+	res := resp.Result()
+
+	assert.True(t, called, "ETagFunc should have been called")
+	assert.Equal(t, `"v1"`, gotETag)
+	assert.Equal(t, "gzip", gotEncoding)
+	assert.Equal(t, `"v1"-gzip`, res.Header.Get("ETag"))
+
+	// Returning an empty string removes the header.
+	opt = ETagFunc(func(origETag, encoding string) string { return "" })
+	resp = serveETagRequest(t, "GET", []option{opt}, setETag(`"v1"`), testBody)
+	assert.Equal(t, "", resp.Result().Header.Get("ETag"))
+
+	// Without an ETag header the callback is never invoked.
+	called = false
+	opt = ETagFunc(func(origETag, encoding string) string {
+		called = true
+		return `"generated"`
+	})
+	resp = serveETagRequest(t, "GET", []option{opt}, nil, testBody)
+	assert.False(t, called, "ETagFunc should not be called without an ETag header")
+	assert.Equal(t, "", resp.Result().Header.Get("ETag"))
+}
+
+func TestETagPassthroughKeepsOriginal(t *testing.T) {
+	strategies := []struct {
+		name string
+		opt  option
+	}{
+		{"remove", RemoveETag()},
+		{"weaken", WeakenETag()},
+		{"func", ETagFunc(func(origETag, encoding string) string {
+			t.Error("ETagFunc must not be called for passthrough responses")
+			return ""
+		})},
+	}
+	cases := []struct {
+		name   string
+		method string
+		setup  func(http.ResponseWriter)
+		body   string
+	}{
+		{"body below min size", "GET", setETag(`"v1"`), smallTestBody},
+		{"204 no content", "GET", func(w http.ResponseWriter) {
+			w.Header().Set("ETag", `"v1"`)
+			w.WriteHeader(http.StatusNoContent)
+		}, ""},
+		{"304 not modified", "GET", func(w http.ResponseWriter) {
+			w.Header().Set("ETag", `"v1"`)
+			w.WriteHeader(http.StatusNotModified)
+		}, ""},
+		{"HEAD request", "HEAD", setETag(`"v1"`), smallTestBody},
+	}
+
+	for _, s := range strategies {
+		for _, tc := range cases {
+			t.Run(s.name+"/"+tc.name, func(t *testing.T) {
+				resp := serveETagRequest(t, tc.method, []option{s.opt}, tc.setup, tc.body)
+				res := resp.Result()
+
+				assert.Equal(t, "", res.Header.Get("Content-Encoding"))
+				assert.Equal(t, `"v1"`, res.Header.Get("ETag"))
+			})
+		}
+	}
+}
+
+func TestETagDefaultKeptOnCompressedResponse(t *testing.T) {
+	resp := serveETagRequest(t, "GET", nil, setETag(`"v1"`), testBody)
+	res := resp.Result()
+
+	assert.Equal(t, "gzip", res.Header.Get("Content-Encoding"))
+	assert.Equal(t, `"v1"`, res.Header.Get("ETag"))
+}
+
+func TestValidEntityTag(t *testing.T) {
+	valid := []string{`"v1"`, `""`, `W/"v1"`, `W/""`, `"~!@#$%^&*"`, "\"\x80\xff\""}
+	invalid := []string{"", `"`, `"" "`, `v1`, `"v1`, `v1"`, `W/`, `w/"v1"`, `W/"v1`, "\"a b\"", "\"a\x7fb\"", "\"a\x1fb\""}
+
+	for _, tag := range valid {
+		assert.True(t, validEntityTag(tag), "expected %q to be valid", tag)
+	}
+	for _, tag := range invalid {
+		assert.False(t, validEntityTag(tag), "expected %q to be invalid", tag)
+	}
+}

@@ -19,6 +19,22 @@ const (
 	contentEncoding = "Content-Encoding"
 	contentType     = "Content-Type"
 	contentLength   = "Content-Length"
+	etag            = "ETag"
+)
+
+// etagStrategy defines how the ETag header is rewritten when a response is
+// actually compressed. Responses passed through uncompressed always keep
+// their original ETag header.
+type etagStrategy int
+
+const (
+	// etagKeep leaves the ETag header untouched. This is the default.
+	etagKeep etagStrategy = iota
+	// etagRemove deletes the ETag header when the response is compressed.
+	etagRemove
+	// etagWeaken rewrites a strong ETag to its weak form (by prepending
+	// "W/") when the response is compressed.
+	etagWeaken
 )
 
 type codings map[string]float64
@@ -86,6 +102,9 @@ type GzipResponseWriter struct {
 	ignore  bool   // If true, then we immediately passthru writes to the underlying ResponseWriter.
 
 	contentTypes []parsedContentType // Only compress if the response is one of these content-types. All are accepted if empty.
+
+	etagStrategy etagStrategy                           // How to rewrite the ETag header when the response is compressed.
+	etagFunc     func(origETag, encoding string) string // Optional callback to compute a new ETag for compressed responses.
 }
 
 type GzipResponseWriterWithCloseNotify struct {
@@ -156,6 +175,12 @@ func (w *GzipResponseWriter) startGzip() error {
 	// See: https://github.com/golang/go/issues/14975.
 	w.Header().Del(contentLength)
 
+	// Rewrite the ETag header for the encoded representation. This must
+	// happen here, just before the headers are committed to the underlying
+	// ResponseWriter, because the decision to compress is often made after
+	// the handler has already called WriteHeader.
+	w.applyETagPolicy("gzip")
+
 	// Write the header to gzip response.
 	if w.code != 0 {
 		w.ResponseWriter.WriteHeader(w.code)
@@ -180,6 +205,81 @@ func (w *GzipResponseWriter) startGzip() error {
 		return err
 	}
 	return nil
+}
+
+// applyETagPolicy rewrites the ETag header of a response that is about to be
+// compressed, according to the configured strategy. It is only called when
+// compression actually happens; passthrough responses keep their original
+// ETag header.
+func (w *GzipResponseWriter) applyETagPolicy(encoding string) {
+	h := w.Header()
+
+	if w.etagFunc != nil {
+		// The callback is only invoked when the handler actually set an
+		// ETag; it receives the original value and the content coding, and
+		// whatever it returns replaces the header. Returning an empty
+		// string removes the header.
+		if orig := h.Get(etag); orig != "" {
+			if newTag := w.etagFunc(orig, encoding); newTag != "" {
+				h.Del(etag)
+				h.Set(etag, newTag)
+			} else {
+				h.Del(etag)
+			}
+		}
+		return
+	}
+
+	switch w.etagStrategy {
+	case etagRemove:
+		h.Del(etag)
+	case etagWeaken:
+		weakenETag(h)
+	}
+}
+
+// weakenETag rewrites a strong ETag header to its weak form. A header that is
+// already weak is left untouched, so the "W/" prefix is never applied twice.
+// An ETag header holding multiple values, or a single value that is not a
+// valid entity-tag per RFC 7232, cannot be weakened unambiguously and is
+// removed instead.
+func weakenETag(h http.Header) {
+	vals := h[http.CanonicalHeaderKey(etag)]
+	if len(vals) != 1 {
+		if len(vals) > 0 {
+			h.Del(etag)
+		}
+		return
+	}
+
+	tag := vals[0]
+	if !validEntityTag(tag) {
+		h.Del(etag)
+		return
+	}
+	if strings.HasPrefix(tag, "W/") {
+		return
+	}
+	h.Set(etag, "W/"+tag)
+}
+
+// validEntityTag reports whether s is a valid entity-tag as defined by
+// RFC 7232, section 2.3: entity-tag = [ weak ] opaque-tag, where the weak
+// indicator is the case-sensitive prefix "W/" and opaque-tag is a quoted
+// string of etagc characters.
+func validEntityTag(s string) bool {
+	t := strings.TrimPrefix(s, "W/")
+	if len(t) < 2 || t[0] != '"' || t[len(t)-1] != '"' {
+		return false
+	}
+	for i := 1; i < len(t)-1; i++ {
+		c := t[i]
+		// etagc = %x21 / %x23-7E / obs-text(%x80-FF)
+		if c == '"' || c < 0x21 || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // startPlain writes to sent bytes and buffer the underlying ResponseWriter without gzip.
@@ -328,6 +428,8 @@ func GzipHandlerWithOpts(opts ...option) (func(http.Handler) http.Handler, error
 					index:          index,
 					minSize:        c.minSize,
 					contentTypes:   c.contentTypes,
+					etagStrategy:   c.etagStrategy,
+					etagFunc:       c.etagFunc,
 				}
 				defer gw.Close()
 
@@ -379,6 +481,8 @@ type config struct {
 	minSize      int
 	level        int
 	contentTypes []parsedContentType
+	etagStrategy etagStrategy
+	etagFunc     func(origETag, encoding string) string
 }
 
 func (c *config) validate() error {
@@ -434,6 +538,48 @@ func ContentTypes(types []string) option {
 				c.contentTypes = append(c.contentTypes, parsedContentType{mediaType, params})
 			}
 		}
+	}
+}
+
+// RemoveETag configures the middleware to delete the ETag header whenever a
+// response is actually compressed, since the original strong validator no
+// longer matches the encoded bytes. Responses passed through uncompressed
+// keep their original ETag header.
+func RemoveETag() option {
+	return func(c *config) {
+		c.etagStrategy = etagRemove
+		c.etagFunc = nil
+	}
+}
+
+// WeakenETag configures the middleware to rewrite a strong ETag to its weak
+// form (by prepending "W/") whenever a response is actually compressed. An
+// ETag that is already weak is left untouched. An ETag header with multiple
+// values, or one that is not a valid entity-tag per RFC 7232, is removed
+// instead. Responses passed through uncompressed keep their original ETag
+// header.
+func WeakenETag() option {
+	return func(c *config) {
+		c.etagStrategy = etagWeaken
+		c.etagFunc = nil
+	}
+}
+
+// ETagFunc configures the middleware to call fn whenever a response is
+// actually compressed and carries an ETag header, so the caller can compute a
+// new validator for the encoded representation. fn receives the original
+// ETag value and the content coding applied (e.g. "gzip"); its return value
+// replaces the ETag header, and returning an empty string removes the
+// header. Responses passed through uncompressed keep their original ETag
+// header and never trigger fn.
+//
+// Note that fn is not given the response body: the middleware streams
+// responses and never buffers them beyond the small minSize window, so
+// computing a hash of the full body here is not possible.
+func ETagFunc(fn func(origETag, encoding string) string) option {
+	return func(c *config) {
+		c.etagFunc = fn
+		c.etagStrategy = etagKeep
 	}
 }
 

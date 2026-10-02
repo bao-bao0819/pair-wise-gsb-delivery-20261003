@@ -34,10 +34,28 @@ func main() {
 
 	withGz := gziphandler.GzipHandler(withoutGz)
 
-	http.Handle("/", withGz)
-	http.ListenAndServe("0.0.0.0:8000", nil)
+http.Handle("/", withGz)
+http.ListenAndServe("0.0.0.0:8000", nil)
 }
 ```
+
+### ETag handling
+
+Compression changes the response bytes, so a strong `ETag` validator set by
+the wrapped handler no longer matches the encoded representation. Use
+`GzipHandlerWithOpts` to choose how the `ETag` header is rewritten when a
+response is actually compressed:
+
+- `RemoveETag()` deletes the `ETag` header.
+- `WeakenETag()` rewrites a strong tag to its weak form (`W/"..."`). Tags
+  that are already weak are left untouched; headers with multiple values or
+  invalid entity-tags are removed.
+- `ETagFunc(fn)` calls `fn` with the original tag and the content coding
+  (e.g. `"gzip"`) so the caller can compute a new validator; returning an
+  empty string removes the header.
+
+Responses passed through uncompressed always keep their original `ETag`
+header. By default the header is left as-is.
 
 
 ## Documentation
