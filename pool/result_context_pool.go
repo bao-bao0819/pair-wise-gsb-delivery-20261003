@@ -11,6 +11,9 @@ import (
 //
 // The configuration methods (With*) will panic if they are used after calling
 // Go() for the first time.
+// When ordered errors are enabled, TaskError.Index matches the original position of
+// its task, including positions omitted from returned results when errored
+// results are not collected.
 type ResultContextPool[T any] struct {
 	contextPool    ContextPool
 	agg            resultAggregator[T]
@@ -21,19 +24,27 @@ type ResultContextPool[T any] struct {
 // are busy, a call to Go() will block until the task can be started.
 func (p *ResultContextPool[T]) Go(f func(context.Context) (T, error)) {
 	idx := p.agg.nextIndex()
-	p.contextPool.Go(func(ctx context.Context) error {
+	p.contextPool.goWithIndex(idx, func(ctx context.Context) error {
 		res, err := f(ctx)
 		p.agg.save(idx, res, err != nil)
 		return err
 	})
 }
 
+// WithOrderedErrors configures the pool to return errors in the order that
+// tasks were submitted. Each error is wrapped in a TaskError.
+func (p *ResultContextPool[T]) WithOrderedErrors() *ResultContextPool[T] {
+	p.panicIfInitialized()
+	p.contextPool.WithOrderedErrors()
+	return p
+}
+
 // Wait cleans up all spawned goroutines, propagates any panics, and
 // returns an error if any of the tasks errored.
 func (p *ResultContextPool[T]) Wait() ([]T, error) {
+	defer func() { p.agg = resultAggregator[T]{} }()
 	err := p.contextPool.Wait()
 	results := p.agg.collect(p.collectErrored)
-	p.agg = resultAggregator[T]{}
 	return results, err
 }
 
@@ -48,6 +59,8 @@ func (p *ResultContextPool[T]) WithCollectErrored() *ResultContextPool[T] {
 
 // WithFirstError configures the pool to only return the first error
 // returned by a task. By default, Wait() will return a combined error.
+// The first error is determined by task completion order, not by task index.
+// When ordered errors are enabled, it is still wrapped in a TaskError.
 func (p *ResultContextPool[T]) WithFirstError() *ResultContextPool[T] {
 	p.panicIfInitialized()
 	p.contextPool.WithFirstError()

@@ -39,9 +39,9 @@ func (p *ResultPool[T]) Go(f func() T) {
 // Wait cleans up all spawned goroutines, propagating any panics, and returning
 // a slice of results from tasks that did not panic.
 func (p *ResultPool[T]) Wait() []T {
+	defer func() { p.agg = resultAggregator[T]{} }()
 	p.pool.Wait()
 	results := p.agg.collect(true)
-	p.agg = resultAggregator[T]{} // reset for reuse
 	return results
 }
 
@@ -86,7 +86,6 @@ func (p *ResultPool[T]) panicIfInitialized() {
 // goroutines. The zero value is valid and ready to use.
 type resultAggregator[T any] struct {
 	mu      sync.Mutex
-	len     int
 	results []T
 	errored []int
 }
@@ -97,20 +96,14 @@ func (r *resultAggregator[T]) nextIndex() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	nextIdx := r.len
-	r.len += 1
+	nextIdx := len(r.results)
+	r.results = append(r.results, *new(T))
 	return nextIdx
 }
 
 func (r *resultAggregator[T]) save(i int, res T, errored bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	if i >= len(r.results) {
-		old := r.results
-		r.results = make([]T, r.len)
-		copy(r.results, old)
-	}
 
 	r.results[i] = res
 
@@ -131,12 +124,13 @@ func (r *resultAggregator[T]) collect(collectErrored bool) []T {
 
 	filtered := r.results[:0]
 	sort.Ints(r.errored)
-	for i, e := range r.errored {
+	for i, erroredIndex := range r.errored {
 		if i == 0 {
-			filtered = append(filtered, r.results[:e]...)
+			filtered = append(filtered, r.results[:erroredIndex]...)
 		} else {
-			filtered = append(filtered, r.results[r.errored[i-1]+1:e]...)
+			filtered = append(filtered, r.results[r.errored[i-1]+1:erroredIndex]...)
 		}
 	}
+	filtered = append(filtered, r.results[r.errored[len(r.errored)-1]+1:]...)
 	return filtered
 }
