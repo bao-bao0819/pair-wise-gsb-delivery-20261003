@@ -256,3 +256,32 @@ func TestCache_EvictionSameKey(t *testing.T) {
 		t.Errorf("evictedKeys got: %v want: %v", evictedKeys, want)
 	}
 }
+
+func TestLRU_GetMultiple(t *testing.T) {
+	l, err := NewLRU[int, int](3, nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	l.Add(1, 0)
+	l.Add(2, 20)
+	l.Add(3, 30)
+
+	keys := []int{3, 9, 1, 3, 2}
+
+	// Read-only: aligned values and flags, recency untouched.
+	values, oks := l.GetMultiple(keys, false)
+	wantValues := []int{30, 0, 0, 30, 20}
+	wantOks := []bool{true, false, true, true, true}
+	if !reflect.DeepEqual(values, wantValues) || !reflect.DeepEqual(oks, wantOks) {
+		t.Errorf("read-only lookup got values=%v oks=%v", values, oks)
+	}
+	l.wantKeys(t, []int{1, 2, 3})
+
+	// Touch mode: first-appearance order is 3, 1, 2; repeats touch once.
+	_, _ = l.GetMultiple(keys, true)
+	l.wantKeys(t, []int{3, 1, 2})
+
+	// Exact eviction order follows the touched recency.
+	l.Add(4, 40)
+	l.wantKeys(t, []int{1, 2, 4})
+}

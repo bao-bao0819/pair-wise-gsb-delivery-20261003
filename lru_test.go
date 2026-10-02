@@ -306,6 +306,172 @@ func (c *Cache[K, V]) wantKeys(t *testing.T, want []K) {
 	}
 }
 
+// TestCache_GetMultiple verifies positional results, including duplicate keys,
+// missing keys and stored zero values.
+func TestCache_GetMultiple(t *testing.T) {
+	l, err := New[int, int](4)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Store an explicitly zero value; it must not be reported as a miss.
+	l.Add(10, 0)
+	l.Add(20, 200)
+	l.Add(30, 300)
+
+	keys := []int{30, 99, 10, 30, 40, 20}
+	results := l.GetMultiple(keys, false)
+	if len(results) != len(keys) {
+		t.Fatalf("expected %d results, got %d", len(keys), len(results))
+	}
+
+	want := []GetResult[int, int]{
+		{Key: 30, Value: 300, OK: true},
+		{Key: 99, Value: 0, OK: false},
+		{Key: 10, Value: 0, OK: true}, // zero value, but present
+		{Key: 30, Value: 300, OK: true},
+		{Key: 40, Value: 0, OK: false},
+		{Key: 20, Value: 200, OK: true},
+	}
+	if !reflect.DeepEqual(results, want) {
+		t.Errorf("GetMultiple results got: %+v, want: %+v", results, want)
+	}
+
+	if results[0].Key != 30 || results[2].Key != 10 {
+		t.Errorf("result keys should mirror input order")
+	}
+	if results[2].Value != 0 || !results[2].OK {
+		t.Errorf("stored zero value must count as a hit")
+	}
+	if results[1].OK || results[4].OK {
+		t.Errorf("absent keys must be reported as misses")
+	}
+
+	// Empty input returns an empty (non-nil), positionally aligned slice.
+	if got := l.GetMultiple(nil, false); len(got) != 0 {
+		t.Errorf("expected no results for empty input, got %v", got)
+	}
+}
+
+// TestCache_GetMultipleReadOnly verifies that a read-only batch never changes
+// recency, so eviction order is unaffected.
+func TestCache_GetMultipleReadOnly(t *testing.T) {
+	var evictedKeys []int
+	l, err := NewWithEvict[int, int](3, func(key, _ int) {
+		evictedKeys = append(evictedKeys, key)
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	l.Add(1, 100)
+	l.Add(2, 200)
+	l.Add(3, 300)
+	l.wantKeys(t, []int{1, 2, 3})
+
+	// Duplicates and misses included; read-only mode changes nothing.
+	l.GetMultiple([]int{9, 3, 1, 3, 2, 8}, false)
+	l.wantKeys(t, []int{1, 2, 3})
+
+	l.Add(4, 400)
+	l.wantKeys(t, []int{2, 3, 4})
+	if !reflect.DeepEqual(evictedKeys, []int{1}) {
+		t.Errorf("read-only batch changed eviction order, evicted: %v", evictedKeys)
+	}
+}
+
+// TestCache_GetMultipleTouch verifies touch semantics: present keys are
+// touched in first-appearance order, each only once, and misses are ignored.
+func TestCache_GetMultipleTouch(t *testing.T) {
+	var evictedKeys []int
+	l, err := NewWithEvict[int, int](3, func(key, _ int) {
+		evictedKeys = append(evictedKeys, key)
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	l.Add(1, 100)
+	l.Add(2, 200)
+	l.Add(3, 300) // LRU order: [1, 2, 3]
+
+	// First-appearance order is 3, 1, 2 (9 is a miss, 3/1 are repeats).
+	l.GetMultiple([]int{3, 9, 1, 3, 2, 1}, true)
+	l.wantKeys(t, []int{3, 1, 2})
+
+	// Inserting until capacity verifies the exact eviction sequence.
+	l.Add(4, 400) // evicts 3
+	l.wantKeys(t, []int{1, 2, 4})
+	l.Add(5, 500) // evicts 1
+	l.wantKeys(t, []int{2, 4, 5})
+	l.Add(6, 600) // evicts 2
+	l.wantKeys(t, []int{4, 5, 6})
+
+	if !reflect.DeepEqual(evictedKeys, []int{3, 1, 2}) {
+		t.Errorf("unexpected eviction order: %v", evictedKeys)
+	}
+}
+
+// TestCache_GetMultipleTouchZeroValue verifies a zero-valued hit is touched
+// like any other hit and survives eviction.
+func TestCache_GetMultipleTouchZeroValue(t *testing.T) {
+	l, err := New[int, int](2)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	l.Add(1, 0)
+	l.Add(2, 200)
+
+	results := l.GetMultiple([]int{1, 7, 1}, true)
+	if !results[0].OK || results[0].Value != 0 {
+		t.Fatalf("zero value must be a hit: %+v", results)
+	}
+
+	l.Add(3, 300)
+	if _, ok := l.Get(1); !ok {
+		t.Errorf("touched zero-valued key should not be evicted")
+	}
+	if _, ok := l.Get(2); ok {
+		t.Errorf("untouched key should have been evicted")
+	}
+}
+
+// TestCache_GetMultipleConcurrent checks the batch runs as one linearizable
+// operation against concurrent Add/Remove/Resize.
+func TestCache_GetMultipleConcurrent(t *testing.T) {
+	l, err := New[int, int](16)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		keys := []int{1, 2, 3, 2, 100}
+		for i := 0; i < 500; i++ {
+			results := l.GetMultiple(keys, i%2 == 0)
+			for j, r := range results {
+				if r.Key != keys[j] {
+					t.Errorf("result key misaligned: got %d want %d", r.Key, keys[j])
+					return
+				}
+			}
+		}
+	}()
+
+	for i := 0; i < 500; i++ {
+		l.Add(i%32, i)
+		if i%10 == 0 {
+			l.Remove(3)
+		}
+		if i%50 == 0 {
+			l.Resize(8 + i%16)
+		}
+	}
+	<-done
+}
+
 func TestCache_EvictionSameKey(t *testing.T) {
 	t.Run("Add", func(t *testing.T) {
 		var evictedKeys []int

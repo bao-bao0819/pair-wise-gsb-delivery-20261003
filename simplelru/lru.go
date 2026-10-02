@@ -76,6 +76,38 @@ func (c *LRU[K, V]) Get(key K) (value V, ok bool) {
 	return
 }
 
+// GetMultiple looks up the values of a group of keys. The returned values and
+// ok flags line up one-to-one with the input keys: ok is false for keys that
+// are absent, so a stored zero value is never confused with a miss.
+//
+// If touch is true, the recency of every present key is updated as if Get were
+// called on it: keys are touched in the order of their first appearance in
+// keys, and a key that occurs more than once is touched only once. If touch is
+// false, recency is left completely untouched.
+func (c *LRU[K, V]) GetMultiple(keys []K, touch bool) (values []V, oks []bool) {
+	values = make([]V, len(keys))
+	oks = make([]bool, len(keys))
+
+	var seen map[K]struct{}
+	if touch {
+		seen = make(map[K]struct{}, len(keys))
+	}
+
+	for i, key := range keys {
+		if ent, ok := c.items[key]; ok {
+			values[i] = ent.Value
+			oks[i] = true
+			if touch {
+				if _, dup := seen[key]; !dup {
+					seen[key] = struct{}{}
+					c.evictList.MoveToFront(ent)
+				}
+			}
+		}
+	}
+	return values, oks
+}
+
 // Contains checks if a key is in the cache, without updating the recent-ness
 // or deleting it for being stale.
 func (c *LRU[K, V]) Contains(key K) (ok bool) {

@@ -99,6 +99,49 @@ func (c *Cache[K, V]) Get(key K) (value V, ok bool) {
 	return value, ok
 }
 
+// GetResult is one element of the slice returned by GetMultiple. It
+// corresponds positionally to a key in the batch input.
+type GetResult[K comparable, V any] struct {
+	// Key is the key this result belongs to, mirroring the input order.
+	Key K
+
+	// Value is the cached value. It is the zero value of V when OK is false.
+	Value V
+
+	// OK reports whether Key was present in the cache. Check this rather than
+	// comparing Value against its zero value.
+	OK bool
+}
+
+// GetMultiple looks up a group of keys in a single operation. The returned
+// results line up one-to-one with keys, in the same order: each result carries
+// the matching key, its value, and an OK flag that marks misses, so a stored
+// zero value is never treated as a miss.
+//
+// If touch is true, the present keys have their recency updated exactly as if
+// Get were called on each of them: touching happens in the order of each key's
+// first appearance in keys, and a key repeated in the batch is touched only
+// once. If touch is false, the cache's eviction order is not affected at all.
+//
+// The whole batch is performed while holding the cache lock, so it is
+// linearizable as a single operation with respect to concurrent Add, Remove
+// and Resize calls.
+func (c *Cache[K, V]) GetMultiple(keys []K, touch bool) []GetResult[K, V] {
+	c.lock.Lock()
+	values, oks := c.lru.GetMultiple(keys, touch)
+	c.lock.Unlock()
+
+	results := make([]GetResult[K, V], len(keys))
+	for i := range keys {
+		results[i] = GetResult[K, V]{
+			Key:   keys[i],
+			Value: values[i],
+			OK:    oks[i],
+		}
+	}
+	return results
+}
+
 // Contains checks if a key is in the cache, without updating the
 // recent-ness or deleting it for being stale.
 func (c *Cache[K, V]) Contains(key K) bool {
