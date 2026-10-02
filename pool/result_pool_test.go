@@ -1,6 +1,7 @@
 package pool_test
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -125,5 +126,53 @@ func TestResultGroup(t *testing.T) {
 		p.Go(func() int { return 2 })
 		results2 := p.Wait()
 		require.Equal(t, []int{2}, results2)
+	})
+}
+
+func TestResultPoolGoContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rejected task leaves no hole in results", func(t *testing.T) {
+		t.Parallel()
+		p := pool.NewWithResults[int]().WithMaxGoroutines(1)
+		started := make(chan struct{})
+		unblock := make(chan struct{})
+		p.Go(func() int {
+			close(started)
+			<-unblock
+			return 0
+		})
+		<-started
+
+		accepted := make(chan error, 1)
+		go func() {
+			accepted <- p.GoContext(context.Background(), func() int { return 1 })
+		}()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		rejected := make(chan error, 1)
+		go func() {
+			rejected <- p.GoContext(ctx, func() int { return 2 })
+		}()
+		cancel()
+		require.ErrorIs(t, <-rejected, context.Canceled)
+
+		close(unblock)
+		require.NoError(t, <-accepted)
+		require.Equal(t, []int{0, 1}, p.Wait())
+	})
+
+	t.Run("accepted tasks keep submission order", func(t *testing.T) {
+		t.Parallel()
+		p := pool.NewWithResults[int]().WithMaxGoroutines(4)
+		for i := 0; i < 100; i++ {
+			i := i
+			require.NoError(t, p.GoContext(context.Background(), func() int { return i }))
+		}
+		results := p.Wait()
+		require.Len(t, results, 100)
+		for i, res := range results {
+			require.Equal(t, i, res)
+		}
 	})
 }

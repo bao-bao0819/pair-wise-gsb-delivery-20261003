@@ -22,7 +22,24 @@ type ContextPool struct {
 // collected and returned by Wait(). If all goroutines in the pool
 // are busy, a call to Go() will block until the task can be started.
 func (p *ContextPool) Go(f func(ctx context.Context) error) {
-	p.errorPool.Go(func() error {
+	// A background context can never be cancelled, so this can never fail.
+	_ = p.GoContext(context.Background(), f)
+}
+
+// GoContext submits a task, like Go(), but the wait for a free slot can be
+// cancelled with ctx. If all goroutines in the pool are busy, GoContext()
+// blocks until the task can be started or ctx is cancelled.
+//
+// The task is considered accepted exactly when GoContext() returns nil: an
+// accepted task is guaranteed to be executed and is accounted for by Wait().
+// If GoContext() returns an error (ctx.Err()), the task was not accepted and
+// will never run.
+//
+// Note that ctx only governs the submission of the task. The task itself
+// still runs under the pool's context, so cancelling ctx after the task has
+// been accepted has no effect.
+func (p *ContextPool) GoContext(ctx context.Context, f func(ctx context.Context) error) error {
+	return p.errorPool.GoContext(ctx, func() error {
 		if p.cancelOnError {
 			// If we are cancelling on error, then we also want to cancel if a
 			// panic is raised. To do this, we need to recover, cancel, and then

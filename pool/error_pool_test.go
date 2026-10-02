@@ -1,6 +1,7 @@
 package pool_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -131,5 +132,47 @@ func TestErrorPool(t *testing.T) {
 		// On reuse, only the new error should be returned
 		require.ErrorIs(t, wait2, err2)
 		require.NotErrorIs(t, wait1, err2)
+	})
+}
+
+func TestErrorPoolGoContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("accepted task errors are collected", func(t *testing.T) {
+		t.Parallel()
+		p := pool.New().WithErrors()
+		require.NoError(t, p.GoContext(context.Background(), func() error {
+			return errors.New("boom")
+		}))
+		require.Error(t, p.Wait())
+	})
+
+	t.Run("cancelled submission never runs and adds no error", func(t *testing.T) {
+		t.Parallel()
+		p := pool.New().WithErrors().WithMaxGoroutines(1)
+		started := make(chan struct{})
+		unblock := make(chan struct{})
+		p.Go(func() error {
+			close(started)
+			<-unblock
+			return nil
+		})
+		<-started
+
+		ctx, cancel := context.WithCancel(context.Background())
+		var ran atomic.Bool
+		submitted := make(chan error, 1)
+		go func() {
+			submitted <- p.GoContext(ctx, func() error {
+				ran.Store(true)
+				return errors.New("boom")
+			})
+		}()
+		cancel()
+		require.ErrorIs(t, <-submitted, context.Canceled)
+
+		close(unblock)
+		require.NoError(t, p.Wait())
+		require.False(t, ran.Load(), "rejected task must never run")
 	})
 }

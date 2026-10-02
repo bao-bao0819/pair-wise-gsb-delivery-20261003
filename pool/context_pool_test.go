@@ -252,3 +252,49 @@ func TestContextPool(t *testing.T) {
 		}
 	})
 }
+
+func TestContextPoolGoContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("cancelled submission never runs", func(t *testing.T) {
+		t.Parallel()
+		p := pool.New().WithMaxGoroutines(1).WithContext(context.Background())
+		started := make(chan struct{})
+		unblock := make(chan struct{})
+		p.Go(func(ctx context.Context) error {
+			close(started)
+			<-unblock
+			return nil
+		})
+		<-started
+
+		ctx, cancel := context.WithCancel(context.Background())
+		var ran atomic.Bool
+		submitted := make(chan error, 1)
+		go func() {
+			submitted <- p.GoContext(ctx, func(context.Context) error {
+				ran.Store(true)
+				return nil
+			})
+		}()
+		cancel()
+		require.ErrorIs(t, <-submitted, context.Canceled)
+
+		close(unblock)
+		require.NoError(t, p.Wait())
+		require.False(t, ran.Load(), "rejected task must never run")
+	})
+
+	t.Run("submission context is not propagated to the task", func(t *testing.T) {
+		t.Parallel()
+		p := pool.New().WithContext(context.Background())
+		submitCtx, cancel := context.WithCancel(context.Background())
+		require.NoError(t, p.GoContext(submitCtx, func(taskCtx context.Context) error {
+			// Cancelling the submission context after the task has been
+			// accepted must not affect the task's own context.
+			cancel()
+			return taskCtx.Err()
+		}))
+		require.NoError(t, p.Wait())
+	})
+}

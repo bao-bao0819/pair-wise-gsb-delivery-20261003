@@ -37,19 +37,43 @@ type Pool struct {
 // Go submits a task to be run in the pool. If all goroutines in the pool
 // are busy, a call to Go() will block until the task can be started.
 func (p *Pool) Go(f func()) {
+	// A background context can never be cancelled, so this can never fail.
+	_ = p.GoContext(context.Background(), f)
+}
+
+// GoContext submits a task to be run in the pool, like Go(), but the wait
+// for a free slot can be cancelled with ctx. If all goroutines in the pool
+// are busy, GoContext() blocks until the task can be started or ctx is
+// cancelled.
+//
+// The task is considered accepted exactly when GoContext() returns nil: an
+// accepted task is guaranteed to be executed and is accounted for by Wait().
+// If GoContext() returns an error (ctx.Err()), the task was not accepted and
+// will never run.
+//
+// Note that ctx only governs the submission of the task. It is not
+// propagated to the task itself, so cancelling ctx after the task has been
+// accepted has no effect.
+func (p *Pool) GoContext(ctx context.Context, f func()) error {
 	p.init()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if p.limiter == nil {
 		// No limit on the number of goroutines.
 		select {
 		case p.tasks <- f:
 			// A goroutine was available to handle the task.
+			return nil
 		default:
 			// No goroutine was available to handle the task.
 			// Spawn a new one and send it the task.
 			p.handle.Go(func() {
 				p.worker(f)
 			})
+			return nil
 		}
 	} else {
 		select {
@@ -59,12 +83,17 @@ func (p *Pool) Go(f func()) {
 			p.handle.Go(func() {
 				p.worker(f)
 			})
+			return nil
 		case p.tasks <- f:
 			// A worker is available and has accepted the task.
-			return
+			return nil
+		case <-ctx.Done():
+			// The submission was cancelled before the task was
+			// accepted. The task was never handed to a worker, so it
+			// will not run.
+			return ctx.Err()
 		}
 	}
-
 }
 
 // Wait cleans up spawned goroutines, propagating any panics that were

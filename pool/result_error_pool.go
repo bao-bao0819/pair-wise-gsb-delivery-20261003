@@ -22,12 +22,37 @@ type ResultErrorPool[T any] struct {
 // Go submits a task to the pool. If all goroutines in the pool
 // are busy, a call to Go() will block until the task can be started.
 func (p *ResultErrorPool[T]) Go(f func() (T, error)) {
+	// A background context can never be cancelled, so this can never fail.
+	_ = p.GoContext(context.Background(), f)
+}
+
+// GoContext submits a task to the pool, like Go(), but the wait for a free
+// slot can be cancelled with ctx. If all goroutines in the pool are busy,
+// GoContext() blocks until the task can be started or ctx is cancelled.
+//
+// The task is considered accepted exactly when GoContext() returns nil: an
+// accepted task is guaranteed to be executed and is accounted for by Wait().
+// If GoContext() returns an error (ctx.Err()), the task was not accepted and
+// will never run. Rejected tasks do not leave a gap in the results returned
+// by Wait().
+//
+// Note that ctx only governs the submission of the task. It is not
+// propagated to the task itself, so cancelling ctx after the task has been
+// accepted has no effect.
+func (p *ResultErrorPool[T]) GoContext(ctx context.Context, f func() (T, error)) error {
 	idx := p.agg.nextIndex()
-	p.errorPool.Go(func() error {
+	err := p.errorPool.GoContext(ctx, func() error {
 		res, err := f()
 		p.agg.save(idx, res, err != nil)
 		return err
 	})
+	if err != nil {
+		// The task was not accepted, so it will never save a result.
+		// Release the reserved slot so it does not leave a hole in the
+		// collected results.
+		p.agg.cancelIndex(idx)
+	}
+	return err
 }
 
 // Wait cleans up any spawned goroutines, propagating any panics and

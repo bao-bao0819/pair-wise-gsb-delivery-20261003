@@ -1,6 +1,7 @@
 package pool_test
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"sync/atomic"
@@ -143,6 +144,59 @@ func TestPool(t *testing.T) {
 		}
 		p.Wait()
 		require.Equal(t, int64(20), count.Load())
+	})
+}
+
+func TestPoolGoContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("accepted tasks run and are waited for", func(t *testing.T) {
+		t.Parallel()
+		p := pool.New().WithMaxGoroutines(2)
+		var completed atomic.Int64
+		for i := 0; i < 10; i++ {
+			require.NoError(t, p.GoContext(context.Background(), func() {
+				completed.Add(1)
+			}))
+		}
+		p.Wait()
+		require.Equal(t, int64(10), completed.Load())
+	})
+
+	t.Run("cancelled while waiting for a slot", func(t *testing.T) {
+		t.Parallel()
+		p := pool.New().WithMaxGoroutines(1)
+		started := make(chan struct{})
+		unblock := make(chan struct{})
+		p.Go(func() {
+			close(started)
+			<-unblock
+		})
+		<-started
+
+		ctx, cancel := context.WithCancel(context.Background())
+		var ran atomic.Bool
+		submitted := make(chan error, 1)
+		go func() {
+			submitted <- p.GoContext(ctx, func() { ran.Store(true) })
+		}()
+		cancel()
+		require.ErrorIs(t, <-submitted, context.Canceled)
+
+		close(unblock)
+		p.Wait()
+		require.False(t, ran.Load(), "rejected task must never run")
+	})
+
+	t.Run("already cancelled context", func(t *testing.T) {
+		t.Parallel()
+		p := pool.New()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var ran atomic.Bool
+		require.ErrorIs(t, p.GoContext(ctx, func() { ran.Store(true) }), context.Canceled)
+		p.Wait()
+		require.False(t, ran.Load())
 	})
 }
 

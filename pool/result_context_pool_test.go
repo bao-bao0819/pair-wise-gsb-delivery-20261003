@@ -245,3 +245,39 @@ func TestResultContextPool(t *testing.T) {
 		require.NotErrorIs(t, errs2, err1)
 	})
 }
+
+func TestResultContextPoolGoContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rejected task leaves no hole in results", func(t *testing.T) {
+		t.Parallel()
+		p := pool.NewWithResults[int]().WithContext(context.Background()).WithMaxGoroutines(1)
+		started := make(chan struct{})
+		unblock := make(chan struct{})
+		p.Go(func(context.Context) (int, error) {
+			close(started)
+			<-unblock
+			return 0, nil
+		})
+		<-started
+
+		accepted := make(chan error, 1)
+		go func() {
+			accepted <- p.GoContext(context.Background(), func(context.Context) (int, error) { return 1, nil })
+		}()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		rejected := make(chan error, 1)
+		go func() {
+			rejected <- p.GoContext(ctx, func(context.Context) (int, error) { return 2, nil })
+		}()
+		cancel()
+		require.ErrorIs(t, <-rejected, context.Canceled)
+
+		close(unblock)
+		require.NoError(t, <-accepted)
+		results, err := p.Wait()
+		require.NoError(t, err)
+		require.Equal(t, []int{0, 1}, results)
+	})
+}
