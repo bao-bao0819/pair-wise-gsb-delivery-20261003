@@ -47,6 +47,7 @@ type parser struct {
 
 	isEOF   bool
 	count   int
+	line    int
 	comment *bytes.Buffer
 }
 
@@ -113,6 +114,9 @@ func (p *parser) readUntil(delim byte) ([]byte, error) {
 		} else {
 			return nil, err
 		}
+	}
+	if len(data) > 0 {
+		p.line++
 	}
 	return data, nil
 }
@@ -341,13 +345,14 @@ func (p *parser) readPythonMultilines(line string, bufferSize int) (string, erro
 			p.debug("readPythonMultilines: failed to skip to the end, returning error")
 			return "", err
 		}
+		p.line++
 
 		line += "\n" + peekMatches[0]
 	}
 }
 
 // parse parses data through an io.Reader.
-func (f *File) parse(reader io.Reader) (err error) {
+func (f *File) parse(reader io.Reader, sourceName string) (err error) {
 	p := newParser(reader, parserOptions{
 		IgnoreContinuation:          f.options.IgnoreContinuation,
 		IgnoreInlineComment:         f.options.IgnoreInlineComment,
@@ -403,6 +408,7 @@ func (f *File) parse(reader io.Reader) (err error) {
 		if err != nil {
 			return err
 		}
+		lineNo := p.line
 
 		if f.options.AllowNestedValues &&
 			isLastValueEmpty && len(line) > 0 {
@@ -415,7 +421,11 @@ func (f *File) parse(reader io.Reader) (err error) {
 			}
 		}
 
-		line = bytes.TrimLeftFunc(line, unicode.IsSpace)
+		trimmed := bytes.TrimLeftFunc(line, unicode.IsSpace)
+		// column is the 1-based byte column of the first non-whitespace
+		// character, i.e. where the key name or section header starts.
+		column := len(line) - len(trimmed) + 1
+		line = trimmed
 		if len(line) == 0 {
 			continue
 		}
@@ -488,6 +498,14 @@ func (f *File) parse(reader io.Reader) (err error) {
 					if err != nil {
 						return err
 					}
+					if f.options.TrackSource {
+						key.sources = append(key.sources, KeySource{
+							Source: sourceName,
+							Line:   lineNo,
+							Column: column,
+							Value:  key.value,
+						})
+					}
 					key.Comment = strings.TrimSpace(p.comment.String())
 					p.comment.Reset()
 					continue
@@ -515,9 +533,17 @@ func (f *File) parse(reader io.Reader) (err error) {
 		}
 		isLastValueEmpty = len(value) == 0
 
-		key, err := section.NewKey(kname, value)
+		key, assigned, err := section.newKey(kname, value)
 		if err != nil {
 			return err
+		}
+		if f.options.TrackSource && assigned != nil {
+			assigned.sources = append(assigned.sources, KeySource{
+				Source: sourceName,
+				Line:   lineNo,
+				Column: column,
+				Value:  value,
+			})
 		}
 		key.isAutoIncrement = isAutoIncr
 		key.Comment = strings.TrimSpace(p.comment.String())

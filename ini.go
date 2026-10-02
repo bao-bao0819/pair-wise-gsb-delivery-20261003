@@ -125,6 +125,11 @@ type LoadOptions struct {
 	AllowNonUniqueSections bool
 	// AllowDuplicateShadowValues indicates whether values for shadowed keys should be deduplicated.
 	AllowDuplicateShadowValues bool
+	// TrackSource indicates whether to record the source identifier, start line
+	// and column of every key assignment during parsing, so the origin and the
+	// override chain of effective values can be inspected via Key.Sources and
+	// Key.Source.
+	TrackSource bool
 }
 
 // DebugFunc is the type of function called to log parse events.

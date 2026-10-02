@@ -294,7 +294,7 @@ func (f *File) reload(s dataSource) error {
 	}
 	defer r.Close()
 
-	return f.parse(r)
+	return f.parse(r, s.Name())
 }
 
 // Reload reloads and parses all data sources.
@@ -303,7 +303,7 @@ func (f *File) Reload() (err error) {
 		if err = f.reload(s); err != nil {
 			// In loose mode, we create an empty default section for nonexistent files.
 			if os.IsNotExist(err) && f.options.Loose {
-				_ = f.parse(bytes.NewBuffer(nil))
+				_ = f.parse(bytes.NewBuffer(nil), s.Name())
 				continue
 			}
 			return err

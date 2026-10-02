@@ -18,6 +18,7 @@ Package ini provides INI file read and write functionality in Go.
 - Read and **WRITE** comments of sections and keys.
 - Manipulate sections, keys and comments with ease.
 - Keep sections and keys in order as you parse and save.
+- Track the source (name, line and column) of every key assignment across merged data sources.
 
 ## Installation
 

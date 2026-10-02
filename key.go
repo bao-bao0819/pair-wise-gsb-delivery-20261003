@@ -36,6 +36,10 @@ type Key struct {
 	shadows  []*Key
 
 	nestedValues []string
+
+	// sources records every assignment of the key's value in parse order.
+	// It is only populated when LoadOptions.TrackSource is enabled.
+	sources []KeySource
 }
 
 // newKey simply return a key object with given values.
@@ -47,21 +51,24 @@ func newKey(s *Section, name, val string) *Key {
 	}
 }
 
-func (k *Key) addShadow(val string) error {
+// addShadow adds a new shadow key with given value and returns it. It returns
+// a nil shadow along with a nil error when the value is dropped by shadow
+// deduplication.
+func (k *Key) addShadow(val string) (*Key, error) {
 	if k.isShadow {
-		return errors.New("cannot add shadow to another shadow key")
+		return nil, errors.New("cannot add shadow to another shadow key")
 	} else if k.isAutoIncrement || k.isBooleanType {
-		return errors.New("cannot add shadow to auto-increment or boolean key")
+		return nil, errors.New("cannot add shadow to auto-increment or boolean key")
 	}
 
 	if !k.s.f.options.AllowDuplicateShadowValues {
 		// Deduplicate shadows based on their values.
 		if k.value == val {
-			return nil
+			return nil, nil
 		}
 		for i := range k.shadows {
 			if k.shadows[i].value == val {
-				return nil
+				return nil, nil
 			}
 		}
 	}
@@ -69,7 +76,7 @@ func (k *Key) addShadow(val string) error {
 	shadow := newKey(k.s, k.name, val)
 	shadow.isShadow = true
 	k.shadows = append(k.shadows, shadow)
-	return nil
+	return shadow, nil
 }
 
 // AddShadow adds a new shadow key to itself.
@@ -77,7 +84,8 @@ func (k *Key) AddShadow(val string) error {
 	if !k.s.f.options.AllowShadows {
 		return errors.New("shadow key is not allowed")
 	}
-	return k.addShadow(val)
+	_, err := k.addShadow(val)
+	return err
 }
 
 func (k *Key) addNestedValue(val string) error {

@@ -64,8 +64,16 @@ func (s *Section) SetBody(body string) {
 
 // NewKey creates a new key to given section.
 func (s *Section) NewKey(name, val string) (*Key, error) {
+	key, _, err := s.newKey(name, val)
+	return key, err
+}
+
+// newKey is NewKey but also returns the key that actually received the value:
+// a shadow key when shadows are enabled and the key name already exists, or
+// nil when the value was dropped by shadow deduplication.
+func (s *Section) newKey(name, val string) (*Key, *Key, error) {
 	if len(name) == 0 {
-		return nil, errors.New("error creating new key: empty key name")
+		return nil, nil, errors.New("error creating new key: empty key name")
 	} else if s.f.options.Insensitive || s.f.options.InsensitiveKeys {
 		name = strings.ToLower(name)
 	}
@@ -77,20 +85,22 @@ func (s *Section) NewKey(name, val string) (*Key, error) {
 
 	if inSlice(name, s.keyList) {
 		if s.f.options.AllowShadows {
-			if err := s.keys[name].addShadow(val); err != nil {
-				return nil, err
+			shadow, err := s.keys[name].addShadow(val)
+			if err != nil {
+				return nil, nil, err
 			}
+			return s.keys[name], shadow, nil
 		} else {
 			s.keys[name].value = val
 			s.keysHash[name] = val
+			return s.keys[name], s.keys[name], nil
 		}
-		return s.keys[name], nil
 	}
 
 	s.keyList = append(s.keyList, name)
 	s.keys[name] = newKey(s, name, val)
 	s.keysHash[name] = val
-	return s.keys[name], nil
+	return s.keys[name], s.keys[name], nil
 }
 
 // NewBooleanKey creates a new boolean type key to given section.
