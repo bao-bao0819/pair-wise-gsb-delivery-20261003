@@ -64,6 +64,12 @@ func (s *Section) SetBody(body string) {
 
 // NewKey creates a new key to given section.
 func (s *Section) NewKey(name, val string) (*Key, error) {
+	return s.newKey(name, val, nil)
+}
+
+// newKey creates a new key to given section and attaches the optional source
+// record when source tracking is enabled.
+func (s *Section) newKey(name, val string, src *ValueSource) (*Key, error) {
 	if len(name) == 0 {
 		return nil, errors.New("error creating new key: empty key name")
 	} else if s.f.options.Insensitive || s.f.options.InsensitiveKeys {
@@ -77,12 +83,13 @@ func (s *Section) NewKey(name, val string) (*Key, error) {
 
 	if inSlice(name, s.keyList) {
 		if s.f.options.AllowShadows {
-			if err := s.keys[name].addShadow(val); err != nil {
+			if err := s.keys[name].addShadow(val, src); err != nil {
 				return nil, err
 			}
 		} else {
 			s.keys[name].value = val
 			s.keysHash[name] = val
+			s.keys[name].appendRecord(src)
 		}
 		return s.keys[name], nil
 	}
@@ -90,12 +97,19 @@ func (s *Section) NewKey(name, val string) (*Key, error) {
 	s.keyList = append(s.keyList, name)
 	s.keys[name] = newKey(s, name, val)
 	s.keysHash[name] = val
+	s.keys[name].appendRecord(src)
 	return s.keys[name], nil
 }
 
 // NewBooleanKey creates a new boolean type key to given section.
 func (s *Section) NewBooleanKey(name string) (*Key, error) {
-	key, err := s.NewKey(name, "true")
+	return s.newBooleanKey(name, nil)
+}
+
+// newBooleanKey creates a new boolean type key and attaches the optional
+// source record when source tracking is enabled.
+func (s *Section) newBooleanKey(name string, src *ValueSource) (*Key, error) {
+	key, err := s.newKey(name, "true", src)
 	if err != nil {
 		return nil, err
 	}

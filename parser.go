@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const minReaderBufferSize = 4096
@@ -47,6 +48,7 @@ type parser struct {
 
 	isEOF   bool
 	count   int
+	line    int // Physical lines read from the data source, starting at 1.
 	comment *bytes.Buffer
 }
 
@@ -66,6 +68,7 @@ func newParser(r io.Reader, opts parserOptions) *parser {
 		buf:     bufio.NewReaderSize(r, size),
 		options: opts,
 		count:   1,
+		line:    1,
 		comment: &bytes.Buffer{},
 	}
 }
@@ -113,6 +116,9 @@ func (p *parser) readUntil(delim byte) ([]byte, error) {
 		} else {
 			return nil, err
 		}
+	}
+	if delim == '\n' {
+		p.line += bytes.Count(data, []byte{'\n'})
 	}
 	return data, nil
 }
@@ -341,13 +347,14 @@ func (p *parser) readPythonMultilines(line string, bufferSize int) (string, erro
 			p.debug("readPythonMultilines: failed to skip to the end, returning error")
 			return "", err
 		}
+		p.line += bytes.Count(peekData, []byte{'\n'})
 
 		line += "\n" + peekMatches[0]
 	}
 }
 
 // parse parses data through an io.Reader.
-func (f *File) parse(reader io.Reader) (err error) {
+func (f *File) parse(reader io.Reader, sourceName string) (err error) {
 	p := newParser(reader, parserOptions{
 		IgnoreContinuation:          f.options.IgnoreContinuation,
 		IgnoreInlineComment:         f.options.IgnoreInlineComment,
@@ -399,6 +406,9 @@ func (f *File) parse(reader io.Reader) (err error) {
 	}
 
 	for !p.isEOF {
+		// Record the physical line where the assignment starts; consuming a
+		// continuation or multi-line value advances the counter afterwards.
+		lineNumber := p.line
 		line, err = p.readUntil('\n')
 		if err != nil {
 			return err
@@ -415,10 +425,14 @@ func (f *File) parse(reader io.Reader) (err error) {
 			}
 		}
 
+		rawLine := line
 		line = bytes.TrimLeftFunc(line, unicode.IsSpace)
 		if len(line) == 0 {
 			continue
 		}
+
+		// 1-based column where the key name starts after leading whitespace.
+		column := utf8.RuneCount(rawLine[:len(rawLine)-len(line)]) + 1
 
 		// Comments
 		if line[0] == '#' || line[0] == ';' {
@@ -484,7 +498,11 @@ func (f *File) parse(reader io.Reader) (err error) {
 					if err != nil {
 						return err
 					}
-					key, err := section.NewBooleanKey(kname)
+					var src *ValueSource
+					if f.options.TrackSources {
+						src = &ValueSource{source: sourceName, line: lineNumber, column: column}
+					}
+					key, err := section.newBooleanKey(kname, src)
 					if err != nil {
 						return err
 					}
@@ -515,7 +533,11 @@ func (f *File) parse(reader io.Reader) (err error) {
 		}
 		isLastValueEmpty = len(value) == 0
 
-		key, err := section.NewKey(kname, value)
+		var src *ValueSource
+		if f.options.TrackSources {
+			src = &ValueSource{source: sourceName, line: lineNumber, column: column}
+		}
+		key, err := section.newKey(kname, value, src)
 		if err != nil {
 			return err
 		}

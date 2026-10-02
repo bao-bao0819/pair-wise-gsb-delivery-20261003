@@ -42,6 +42,10 @@ type File struct {
 	// Actual data is stored here.
 	sections map[string][]*Section
 
+	// sourceNames holds the names of the data sources in the order they were
+	// successfully parsed. It is populated when source tracking is enabled.
+	sourceNames []string
+
 	NameMapper
 	ValueMapper
 }
@@ -294,19 +298,56 @@ func (f *File) reload(s dataSource) error {
 	}
 	defer r.Close()
 
-	return f.parse(r)
+	return f.parse(r, s.sourceName())
+}
+
+// resetSourceTracking clears all previously captured source records so that
+// reloading the data sources produces records that match the actual parse
+// order without duplicates left over from a previous load.
+func (f *File) resetSourceTracking() {
+	f.sourceNames = nil
+	for _, secs := range f.sections {
+		for _, sec := range secs {
+			for _, key := range sec.keys {
+				key.sources = nil
+				key.primarySources = nil
+				for _, shadow := range key.shadows {
+					shadow.sources = nil
+				}
+			}
+		}
+	}
+}
+
+// SourceNames returns the names of the data sources in the order they were
+// successfully parsed. It reflects the actual parse order, including sources
+// skipped in short-circuit mode. The result is nil when source tracking is
+// disabled.
+func (f *File) SourceNames() []string {
+	if len(f.sourceNames) == 0 {
+		return nil
+	}
+	names := make([]string, len(f.sourceNames))
+	copy(names, f.sourceNames)
+	return names
 }
 
 // Reload reloads and parses all data sources.
 func (f *File) Reload() (err error) {
+	if f.options.TrackSources {
+		f.resetSourceTracking()
+	}
 	for _, s := range f.dataSources {
 		if err = f.reload(s); err != nil {
 			// In loose mode, we create an empty default section for nonexistent files.
 			if os.IsNotExist(err) && f.options.Loose {
-				_ = f.parse(bytes.NewBuffer(nil))
+				_ = f.parse(bytes.NewBuffer(nil), "")
 				continue
 			}
 			return err
+		}
+		if f.options.TrackSources {
+			f.sourceNames = append(f.sourceNames, s.sourceName())
 		}
 		if f.options.ShortCircuit {
 			return nil

@@ -36,6 +36,14 @@ type Key struct {
 	shadows  []*Key
 
 	nestedValues []string
+
+	// sources holds all assignment records for the key and its shadow values
+	// in the actual order they were parsed. primarySources holds only the
+	// records that overwrote the primary value, linked through their
+	// Overridden and Overrides pointers. Both are only populated when source
+	// tracking is enabled.
+	sources        []*ValueSource
+	primarySources []*ValueSource
 }
 
 // newKey simply return a key object with given values.
@@ -47,7 +55,7 @@ func newKey(s *Section, name, val string) *Key {
 	}
 }
 
-func (k *Key) addShadow(val string) error {
+func (k *Key) addShadow(val string, src *ValueSource) error {
 	if k.isShadow {
 		return errors.New("cannot add shadow to another shadow key")
 	} else if k.isAutoIncrement || k.isBooleanType {
@@ -68,6 +76,13 @@ func (k *Key) addShadow(val string) error {
 
 	shadow := newKey(k.s, k.name, val)
 	shadow.isShadow = true
+	if src != nil {
+		src.isShadow = true
+		// Keep the record in the key's global parse-order chain as well as on
+		// the shadow value itself.
+		k.sources = append(k.sources, src)
+		shadow.sources = append(shadow.sources, src)
+	}
 	k.shadows = append(k.shadows, shadow)
 	return nil
 }
@@ -77,7 +92,7 @@ func (k *Key) AddShadow(val string) error {
 	if !k.s.f.options.AllowShadows {
 		return errors.New("shadow key is not allowed")
 	}
-	return k.addShadow(val)
+	return k.addShadow(val, nil)
 }
 
 func (k *Key) addNestedValue(val string) error {
@@ -108,6 +123,59 @@ func (k *Key) Name() string {
 // Value returns raw value of key for performance purpose.
 func (k *Key) Value() string {
 	return k.value
+}
+
+// appendRecord records a new assignment for the key's primary value slot,
+// linking it to the previous primary assignment (the value it overwrote). It
+// is a no-op when source tracking is disabled or when record is nil.
+func (k *Key) appendRecord(record *ValueSource) {
+	if record == nil {
+		return
+	}
+	if len(k.primarySources) > 0 {
+		record.prev = k.primarySources[len(k.primarySources)-1]
+		record.prev.next = record
+	}
+	k.sources = append(k.sources, record)
+	k.primarySources = append(k.primarySources, record)
+}
+
+// ValueSource returns the source record of the key's current primary value,
+// i.e. the last assignment that overwrote it. Shadow assignments do not
+// overwrite the primary value and are excluded here; use ValueSources to
+// inspect them. It returns nil when source tracking is disabled (see
+// LoadOptions.TrackSources) or the key was not produced by parsing.
+//
+// Querying the source does not invoke the file's ValueMapper, hence the number
+// of mapper calls is unaffected.
+func (k *Key) ValueSource() *ValueSource {
+	if k.isShadow {
+		if len(k.sources) == 0 {
+			return nil
+		}
+		return k.sources[len(k.sources)-1]
+	}
+	if len(k.primarySources) == 0 {
+		return nil
+	}
+	return k.primarySources[len(k.primarySources)-1]
+}
+
+// ValueSources returns all assignment records of the key and of its shadow
+// values in the actual order they were parsed. Records that overwrite the same
+// value slot are linked through ValueSource.Overridden and
+// ValueSource.Overrides.
+//
+// It returns nil when source tracking is disabled or the key was not produced
+// by parsing.
+func (k *Key) ValueSources() []*ValueSource {
+	if len(k.sources) == 0 {
+		return nil
+	}
+
+	sources := make([]*ValueSource, len(k.sources))
+	copy(sources, k.sources)
+	return sources
 }
 
 // ValueWithShadows returns raw values of key and its shadows if any. Shadow
