@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -629,6 +630,287 @@ func TestWorkerLeak(t *testing.T) {
 	})
 }
 
+func TestSubmitHandle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1)
+		defer wp.Stop()
+
+		if h := wp.SubmitHandle(nil); h != nil {
+			t.Fatal("expected nil handle for nil task")
+		}
+
+		ran := make(chan struct{})
+		h := wp.SubmitHandle(func() {
+			close(ran)
+		})
+		if h == nil {
+			t.Fatal("expected a task handle")
+		}
+		select {
+		case <-ran:
+		case <-time.After(time.Second):
+			t.Fatal("task submitted with SubmitHandle did not run")
+		}
+		synctest.Wait()
+		if got := h.Cancel(); got != CancelDone {
+			t.Fatal("expected CancelDone, got", got)
+		}
+	})
+}
+
+func TestCancelQueued(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1)
+		defer wp.Stop()
+
+		// Occupy the only worker until the gate opens, so that tasks
+		// submitted next pile up on the waiting queue.
+		gate := make(chan struct{})
+		started := make(chan struct{})
+		wp.Submit(func() {
+			close(started)
+			<-gate
+		})
+		<-started
+
+		ran := make(chan string, 3)
+		first := wp.SubmitHandle(func() { ran <- "first" })
+		middle := wp.SubmitHandle(func() { ran <- "middle" })
+		last := wp.SubmitHandle(func() { ran <- "last" })
+		synctest.Wait()
+
+		if wp.WaitingQueueSize() != 3 {
+			t.Fatal("expected 3 waiting tasks, have", wp.WaitingQueueSize())
+		}
+
+		// The front task is committed to run next, so it cannot be canceled.
+		if got := first.Cancel(); got != CancelRunning {
+			t.Fatal("expected CancelRunning for next-to-run task, got", got)
+		}
+
+		if got := middle.Cancel(); got != CancelCanceled {
+			t.Fatal("expected CancelCanceled, got", got)
+		}
+		if middle.fn != nil {
+			t.Fatal("canceled task did not release its function")
+		}
+		if wp.WaitingQueueSize() != 2 {
+			t.Fatal("expected waiting queue size 2 after cancel, have", wp.WaitingQueueSize())
+		}
+		// Canceling an already canceled task reports the same result.
+		if got := middle.Cancel(); got != CancelCanceled {
+			t.Fatal("expected CancelCanceled for repeated cancel, got", got)
+		}
+
+		close(gate)
+		wp.StopWait()
+
+		for _, want := range []string{"first", "last"} {
+			select {
+			case got := <-ran:
+				if got != want {
+					t.Fatal("expected", want, "to run, got", got)
+				}
+			default:
+				t.Fatal(want, "did not run")
+			}
+		}
+		select {
+		case <-ran:
+			t.Fatal("canceled task ran")
+		default:
+		}
+		if got := last.Cancel(); got != CancelDone {
+			t.Fatal("expected CancelDone, got", got)
+		}
+	})
+}
+
+func TestCancelRunningDone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1)
+		defer wp.Stop()
+
+		release := make(chan struct{})
+		started := make(chan struct{})
+		h := wp.SubmitHandle(func() {
+			close(started)
+			<-release
+		})
+		<-started
+		if got := h.Cancel(); got != CancelRunning {
+			t.Fatal("expected CancelRunning, got", got)
+		}
+
+		close(release)
+		synctest.Wait()
+		if got := h.Cancel(); got != CancelDone {
+			t.Fatal("expected CancelDone, got", got)
+		}
+	})
+}
+
+func TestCancelInFlight(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1)
+		defer wp.Stop()
+
+		gate := make(chan struct{})
+		wp.Submit(func() { <-gate })
+		synctest.Wait()
+
+		// Cancel immediately after submission; the task may still be in
+		// flight to the dispatcher, but it must never run.
+		var ran atomic.Bool
+		h := wp.SubmitHandle(func() { ran.Store(true) })
+		if got := h.Cancel(); got != CancelCanceled {
+			t.Fatal("expected CancelCanceled, got", got)
+		}
+
+		close(gate)
+		wp.StopWait()
+		if ran.Load() {
+			t.Fatal("canceled task ran")
+		}
+	})
+}
+
+func TestCancelFIFO(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1)
+		defer wp.Stop()
+
+		// Occupy the only worker until the gate opens, so that all tasks
+		// submitted next pile up on the waiting queue.
+		gate := make(chan struct{})
+		started := make(chan struct{})
+		wp.Submit(func() {
+			close(started)
+			<-gate
+		})
+		<-started
+
+		const n = 100
+		handles := make([]*Task, n)
+		order := make(chan int, n)
+		for i := 0; i < n; i++ {
+			handles[i] = wp.SubmitHandle(func() {
+				order <- i
+			})
+		}
+		synctest.Wait()
+		if wp.WaitingQueueSize() != n {
+			t.Fatal("expected", n, "waiting tasks, have", wp.WaitingQueueSize())
+		}
+
+		// Cancel all odd-numbered tasks in the middle of the queue.
+		var canceled int
+		for i := 1; i < n; i += 2 {
+			if got := handles[i].Cancel(); got != CancelCanceled {
+				t.Fatalf("cancel task %d: expected CancelCanceled, got %s", i, got)
+			}
+			canceled++
+		}
+		if wp.WaitingQueueSize() != n-canceled {
+			t.Fatal("expected waiting queue size", n-canceled, "have", wp.WaitingQueueSize())
+		}
+
+		close(gate)
+		wp.StopWait()
+
+		// The remaining tasks must have run in FIFO order.
+		for i := 0; i < n; i += 2 {
+			select {
+			case got := <-order:
+				if got != i {
+					t.Fatal("expected task", i, "to run, got", got)
+				}
+			default:
+				t.Fatal("task", i, "did not run")
+			}
+		}
+		select {
+		case got := <-order:
+			t.Fatal("canceled task", got, "ran")
+		default:
+		}
+	})
+}
+
+func TestCancelPause(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(2)
+		defer wp.Stop()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		wp.Pause(ctx)
+
+		const n = 10
+		var ran atomic.Int32
+		handles := make([]*Task, n)
+		for i := 0; i < n; i++ {
+			handles[i] = wp.SubmitHandle(func() { ran.Add(1) })
+		}
+		synctest.Wait()
+		if wp.WaitingQueueSize() != n {
+			t.Fatal("expected", n, "waiting tasks, have", wp.WaitingQueueSize())
+		}
+
+		// Cancel half of the queued tasks while the pool is paused.
+		for i := 1; i < n; i += 2 {
+			if got := handles[i].Cancel(); got != CancelCanceled {
+				t.Fatalf("cancel task %d: expected CancelCanceled, got %s", i, got)
+			}
+		}
+		if wp.WaitingQueueSize() != n/2 {
+			t.Fatal("expected waiting queue size", n/2, "have", wp.WaitingQueueSize())
+		}
+
+		cancel()
+		wp.StopWait()
+		if ran.Load() != n/2 {
+			t.Fatal("expected", n/2, "tasks to run, got", ran.Load())
+		}
+	})
+}
+
+// TestCancelStopWaitRace checks that racing Cancel with StopWait leaves every
+// received task with exactly one terminal state: each task either runs to
+// completion or is canceled, never both, never neither. Run with -race.
+func TestCancelStopWaitRace(t *testing.T) {
+	wp := New(2)
+
+	const n = 200
+	var ran atomic.Int32
+	handles := make([]*Task, n)
+	for i := 0; i < n; i++ {
+		handles[i] = wp.SubmitHandle(func() {
+			time.Sleep(time.Millisecond)
+			ran.Add(1)
+		})
+	}
+
+	var canceled atomic.Int32
+	var wg sync.WaitGroup
+	for _, h := range handles {
+		wg.Add(1)
+		go func(h *Task) {
+			defer wg.Done()
+			if h.Cancel() == CancelCanceled {
+				canceled.Add(1)
+			}
+		}(h)
+	}
+	wp.StopWait()
+	wg.Wait()
+
+	total := ran.Load() + canceled.Load()
+	if total != n {
+		t.Fatal("each task must either run or be canceled: ran", ran.Load(),
+			"canceled", canceled.Load(), "of", n)
+	}
+}
+
 func TestPanicDo(t *testing.T) {
 	wp := New(1)
 	wp.Stop()
@@ -665,6 +947,17 @@ func TestPanicDo(t *testing.T) {
 		t.Fatal("task function should not have called")
 	default:
 	}
+
+	assertPanics(t, "SubmitHandle", func() {
+		wp.SubmitHandle(func() {
+			close(done)
+		})
+	})
+	select {
+	case <-done:
+		t.Fatal("task function should not have called")
+	default:
+	}
 }
 
 func assertPanics(t *testing.T, name string, f func()) {
@@ -684,7 +977,7 @@ func anyReady(w *WorkerPool) bool {
 		<-release
 	}
 	select {
-	case w.workerQueue <- wait:
+	case w.workerQueue <- &Task{fn: wait}:
 		close(release)
 		return true
 	default:
@@ -702,7 +995,7 @@ func countReady(w *WorkerPool) int {
 	var readyCount int
 	for i := 0; i < max; i++ {
 		select {
-		case w.workerQueue <- wait:
+		case w.workerQueue <- &Task{fn: wait}:
 			readyCount++
 		case <-timeout:
 			i = max

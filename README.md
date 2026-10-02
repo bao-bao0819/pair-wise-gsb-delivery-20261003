@@ -47,6 +47,29 @@ func main() {
 
 [Example wrapper function](https://go.dev/play/p/BWnRhJYarZ1) to show start and finish time of submitted function.
 
+## Canceling Queued Tasks
+
+Use `SubmitHandle` to get a handle to a submitted task. The handle can cancel
+the task as long as it has not started executing:
+
+```go
+wp := workerpool.New(2)
+defer wp.Stop()
+
+handle := wp.SubmitHandle(func() {
+	fmt.Println("Handling request")
+})
+
+switch handle.Cancel() {
+case workerpool.CancelCanceled:
+	// Task was still queued and is now canceled; it will never run.
+case workerpool.CancelRunning:
+	// Task had already started executing.
+case workerpool.CancelDone:
+	// Task had already finished executing.
+}
+```
+
 ## Usage Note
 
 There is no upper limit on the number of tasks queued, other than the limits of system resources. If the number of inbound tasks is too many to even queue for pending processing, then the solution is outside the scope of workerpool. It should be solved by distributing workload over multiple systems, and/or storing input for pending processing in intermediate storage such as a file system, distributed message queue, etc.

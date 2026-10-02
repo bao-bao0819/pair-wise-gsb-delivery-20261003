@@ -12,6 +12,91 @@ import (
 
 var ErrStopped = errors.New("submitting work to stopped workerpool")
 
+// CancelResult describes the outcome of a call to Task.Cancel.
+type CancelResult int
+
+const (
+	// CancelCanceled indicates that the task had not started executing and
+	// has been canceled. The task is removed from the waiting queue and
+	// will never run.
+	CancelCanceled CancelResult = iota
+	// CancelRunning indicates that the task had already started executing,
+	// or was committed to run next, and could not be canceled.
+	CancelRunning
+	// CancelDone indicates that the task had already finished executing.
+	CancelDone
+)
+
+// String returns a string representation of the CancelResult.
+func (r CancelResult) String() string {
+	switch r {
+	case CancelCanceled:
+		return "canceled"
+	case CancelRunning:
+		return "running"
+	case CancelDone:
+		return "done"
+	}
+	return "unknown"
+}
+
+type taskState int
+
+const (
+	taskPending taskState = iota
+	taskRunning
+	taskDone
+	taskCanceled
+)
+
+// Task is a handle to a task submitted to the worker pool with SubmitHandle.
+// It allows a task that has not yet started executing to be canceled.
+type Task struct {
+	fn    func()
+	pool  *WorkerPool
+	state taskState
+}
+
+// Cancel cancels the task if it has not started executing, and reports the
+// outcome:
+//
+//   - CancelCanceled: the task was still waiting and is now canceled. It is
+//     removed from the waiting queue, its function reference is released, and
+//     it will never run.
+//   - CancelRunning: the task had already started executing, or the
+//     dispatcher has committed it to run next.
+//   - CancelDone: the task had already finished executing.
+//
+// Canceling a task that was already canceled reports CancelCanceled again.
+// A task has exactly one terminal state: it either runs to completion or is
+// canceled, even when Cancel races with Stop, StopWait, or Pause.
+func (t *Task) Cancel() CancelResult {
+	p := t.pool
+	p.queueLock.Lock()
+	defer p.queueLock.Unlock()
+	switch t.state {
+	case taskPending:
+		// Remove the task from the waiting queue if it is there. If it is
+		// not, then it is in flight between submission and the dispatcher,
+		// and the dispatcher will drop it without running it.
+		idx := p.waitingQueue.Index(func(queued *Task) bool { return queued == t })
+		if idx >= 0 {
+			p.waitingQueue.Remove(idx)
+			p.waiting.Store(int32(p.waitingQueue.Len()))
+		}
+		t.state = taskCanceled
+		t.fn = nil
+		return CancelCanceled
+	case taskRunning:
+		return CancelRunning
+	case taskDone:
+		return CancelDone
+	default:
+		// Already canceled.
+		return CancelCanceled
+	}
+}
+
 // New creates and starts a pool of worker goroutines.
 //
 // The maxWorkers parameter specifies the maximum number of workers that can
@@ -32,8 +117,8 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 
 	pool := &WorkerPool{
 		maxWorkers:  maxWorkers,
-		taskQueue:   make(chan func()),
-		workerQueue: make(chan func()),
+		taskQueue:   make(chan *Task),
+		workerQueue: make(chan *Task),
 		stopSignal:  make(chan struct{}),
 		stoppedChan: make(chan struct{}),
 	}
@@ -48,11 +133,12 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 // goroutines processing requests does not exceed the specified maximum.
 type WorkerPool struct {
 	maxWorkers   int
-	taskQueue    chan func()
-	workerQueue  chan func()
+	taskQueue    chan *Task
+	workerQueue  chan *Task
 	stoppedChan  chan struct{}
 	stopSignal   chan struct{}
-	waitingQueue deque.Deque[func()]
+	waitingQueue deque.Deque[*Task]
+	queueLock    sync.Mutex
 	stopLock     sync.Mutex
 	stopOnce     sync.Once
 	stopped      bool
@@ -114,6 +200,10 @@ func (p *WorkerPool) Do(task func()) (err error) {
 	if task == nil {
 		return
 	}
+	return p.do(&Task{fn: task, pool: p})
+}
+
+func (p *WorkerPool) do(task *Task) (err error) {
 	defer func() {
 		if recover() != nil {
 			err = ErrStopped
@@ -129,6 +219,21 @@ func (p *WorkerPool) Submit(task func()) {
 	if err := p.Do(task); err != nil {
 		panic(err)
 	}
+}
+
+// SubmitHandle enqueues the given function without blocking and returns a
+// handle to the submitted task. The handle's Cancel method can be used to
+// cancel the task while it is still waiting to be executed. Panics if the
+// worker pool is stopped. Returns nil if task is nil.
+func (p *WorkerPool) SubmitHandle(task func()) *Task {
+	if task == nil {
+		return nil
+	}
+	t := &Task{fn: task, pool: p}
+	if err := p.do(t); err != nil {
+		panic(err)
+	}
+	return t
 }
 
 // SubmitWait enqueues the given function, without blocking, and waits for it
@@ -171,12 +276,15 @@ func (p *WorkerPool) Pause(ctx context.Context) {
 	ready := new(sync.WaitGroup)
 	ready.Add(p.maxWorkers)
 	for i := 0; i < p.maxWorkers; i++ {
-		p.taskQueue <- func() {
-			ready.Done()
-			select {
-			case <-ctx.Done():
-			case <-p.stopSignal:
-			}
+		p.taskQueue <- &Task{
+			fn: func() {
+				ready.Done()
+				select {
+				case <-ctx.Done():
+				case <-p.stopSignal:
+				}
+			},
+			pool: p,
 		}
 	}
 	// Wait for workers to all be paused
@@ -204,7 +312,7 @@ Loop:
 		// into the waiting queue and tasks to run are taken from the waiting
 		// queue. Once the waiting queue is empty, then go back to submitting
 		// incoming tasks directly to available workers.
-		if p.waitingQueue.Len() != 0 {
+		if p.waiting.Load() != 0 {
 			if !p.processWaitingQueue() {
 				break Loop
 			}
@@ -217,13 +325,22 @@ Loop:
 				break Loop
 			}
 			// Got a task to do.
+			p.queueLock.Lock()
+			if task.state == taskCanceled {
+				// Task was canceled while in flight; drop it.
+				p.queueLock.Unlock()
+				idle = false
+				continue
+			}
 			select {
 			case p.workerQueue <- task:
+				task.state = taskRunning
 			default:
 				// Create a new worker, if not at max.
 				if workerCount < p.maxWorkers {
+					task.state = taskRunning
 					wg.Add(1)
-					go worker(task, p.workerQueue, &wg)
+					go worker(task, p.workerQueue, &wg, p)
 					workerCount++
 				} else {
 					// Enqueue task to be executed by next available worker.
@@ -231,6 +348,7 @@ Loop:
 					p.waiting.Store(int32(p.waitingQueue.Len()))
 				}
 			}
+			p.queueLock.Unlock()
 			idle = false
 		case <-idleTO:
 			// Timed out waiting for work to arrive. Kill a ready worker if
@@ -259,9 +377,13 @@ Loop:
 }
 
 // worker executes tasks and stops when it receives a nil task.
-func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
+func worker(task *Task, workerQueue chan *Task, wg *sync.WaitGroup, p *WorkerPool) {
 	for task != nil {
-		task()
+		task.fn()
+		p.queueLock.Lock()
+		task.state = taskDone
+		task.fn = nil
+		p.queueLock.Unlock()
 		task = <-workerQueue
 	}
 	wg.Done()
@@ -292,17 +414,39 @@ func (p *WorkerPool) stop(wait bool) {
 // tasks from the waiting queue as workers become available. Returns false if
 // worker pool is stopped.
 func (p *WorkerPool) processWaitingQueue() bool {
+	p.queueLock.Lock()
+	if p.waitingQueue.Len() == 0 {
+		// Canceled tasks may have emptied the waiting queue since it was
+		// last checked.
+		p.queueLock.Unlock()
+		return true
+	}
+	// Reserve the front task; it is committed to run as soon as a worker is
+	// ready, so it can no longer be canceled. It stays on the waiting queue
+	// until it is handed to a worker.
+	task := p.waitingQueue.Front()
+	task.state = taskRunning
+	p.queueLock.Unlock()
+
 	select {
-	case task, ok := <-p.taskQueue:
+	case newTask, ok := <-p.taskQueue:
 		if !ok {
 			return false
 		}
-		p.waitingQueue.PushBack(task)
-	case p.workerQueue <- p.waitingQueue.Front():
+		p.queueLock.Lock()
+		if newTask.state == taskPending {
+			p.waitingQueue.PushBack(newTask)
+			p.waiting.Store(int32(p.waitingQueue.Len()))
+		}
+		// Else, the task was canceled while in flight; drop it.
+		p.queueLock.Unlock()
+	case p.workerQueue <- task:
 		// A worker was ready, so gave task to worker.
+		p.queueLock.Lock()
 		p.waitingQueue.PopFront()
+		p.waiting.Store(int32(p.waitingQueue.Len()))
+		p.queueLock.Unlock()
 	}
-	p.waiting.Store(int32(p.waitingQueue.Len()))
 	return true
 }
 
@@ -320,9 +464,17 @@ func (p *WorkerPool) killIdleWorker() bool {
 // runQueuedTasks removes each task from the waiting queue and gives it to
 // workers until queue is empty.
 func (p *WorkerPool) runQueuedTasks() {
-	for p.waitingQueue.Len() != 0 {
-		// A worker is ready, so give task to worker.
-		p.workerQueue <- p.waitingQueue.PopFront()
+	for {
+		p.queueLock.Lock()
+		if p.waitingQueue.Len() == 0 {
+			p.queueLock.Unlock()
+			return
+		}
+		task := p.waitingQueue.PopFront()
+		task.state = taskRunning
 		p.waiting.Store(int32(p.waitingQueue.Len()))
+		p.queueLock.Unlock()
+		// A worker is ready, so give task to worker.
+		p.workerQueue <- task
 	}
 }

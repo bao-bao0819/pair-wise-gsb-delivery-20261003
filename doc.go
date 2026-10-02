@@ -24,6 +24,15 @@ distributing load over multiple systems, and/or storing input for pending
 processing in intermediate storage such as a database, file system, distributed
 message queue, etc.
 
+Canceling queued tasks
+
+Submitting a task with SubmitHandle returns a Task handle that can cancel the
+task while it is still waiting to be executed. Task.Cancel reports whether the
+task was canceled, had already started, or had already finished. A canceled
+task is removed from the waiting queue and never runs; a task that is not
+canceled runs exactly once, even when cancellation races with Stop, StopWait,
+or Pause.
+
 Dispatcher
 
 This worker pool uses a single dispatcher goroutine to read tasks from the
