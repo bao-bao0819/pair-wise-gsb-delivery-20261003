@@ -170,6 +170,325 @@ AllowedIPs = 192.168.2.4/32
 	})
 }
 
+func TestFile_RenameSectionWithIndex(t *testing.T) {
+	input := `[Interface]
+Address = 192.168.2.1
+
+; first peer
+[Peer]
+PublicKey = <client1>
+
+[Peer]
+PublicKey = <client2>
+
+; last peer
+[Peer]
+PublicKey = <client3>
+`
+	load := func(t *testing.T) *File {
+		f, err := LoadSources(LoadOptions{
+			AllowNonUniqueSections: true,
+		}, []byte(input))
+		require.NoError(t, err)
+		require.NotNil(t, f)
+		return f
+	}
+
+	t.Run("rename the first instance", func(t *testing.T) {
+		f := load(t)
+
+		err := f.RenameSectionWithIndex("Peer", 0, "FirstPeer", false)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{DefaultSection, "Interface", "FirstPeer", "Peer", "Peer"}, f.SectionStrings())
+
+		// The renamed section keeps its keys and comment
+		sec := f.SectionWithIndex("FirstPeer", 0)
+		assert.Equal(t, "FirstPeer", sec.Name())
+		assert.Equal(t, "<client1>", sec.Key("PublicKey").String())
+		assert.Equal(t, "; first peer", sec.Comment)
+
+		// The relative order of the remaining instances is unchanged
+		peers, err := f.SectionsByName("Peer")
+		require.NoError(t, err)
+		require.Len(t, peers, 2)
+		assert.Equal(t, "<client2>", peers[0].Key("PublicKey").String())
+		assert.Equal(t, "<client3>", peers[1].Key("PublicKey").String())
+
+		var buf bytes.Buffer
+		_, err = f.WriteTo(&buf)
+		require.NoError(t, err)
+		assert.Equal(t, `[Interface]
+Address = 192.168.2.1
+
+; first peer
+[FirstPeer]
+PublicKey = <client1>
+
+[Peer]
+PublicKey = <client2>
+
+; last peer
+[Peer]
+PublicKey = <client3>
+`, buf.String())
+	})
+
+	t.Run("rename the middle instance", func(t *testing.T) {
+		f := load(t)
+
+		err := f.RenameSectionWithIndex("Peer", 1, "Middle", false)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{DefaultSection, "Interface", "Peer", "Middle", "Peer"}, f.SectionStrings())
+		assert.Equal(t, "<client2>", f.SectionWithIndex("Middle", 0).Key("PublicKey").String())
+
+		peers, err := f.SectionsByName("Peer")
+		require.NoError(t, err)
+		require.Len(t, peers, 2)
+		assert.Equal(t, "<client1>", peers[0].Key("PublicKey").String())
+		assert.Equal(t, "<client3>", peers[1].Key("PublicKey").String())
+
+		var buf bytes.Buffer
+		_, err = f.WriteTo(&buf)
+		require.NoError(t, err)
+		assert.Equal(t, `[Interface]
+Address = 192.168.2.1
+
+; first peer
+[Peer]
+PublicKey = <client1>
+
+[Middle]
+PublicKey = <client2>
+
+; last peer
+[Peer]
+PublicKey = <client3>
+`, buf.String())
+	})
+
+	t.Run("rename the last instance", func(t *testing.T) {
+		f := load(t)
+
+		err := f.RenameSectionWithIndex("Peer", 2, "LastPeer", false)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{DefaultSection, "Interface", "Peer", "Peer", "LastPeer"}, f.SectionStrings())
+		assert.Equal(t, "<client3>", f.SectionWithIndex("LastPeer", 0).Key("PublicKey").String())
+
+		peers, err := f.SectionsByName("Peer")
+		require.NoError(t, err)
+		require.Len(t, peers, 2)
+		assert.Equal(t, "<client1>", peers[0].Key("PublicKey").String())
+		assert.Equal(t, "<client2>", peers[1].Key("PublicKey").String())
+
+		var buf bytes.Buffer
+		_, err = f.WriteTo(&buf)
+		require.NoError(t, err)
+		assert.Equal(t, `[Interface]
+Address = 192.168.2.1
+
+; first peer
+[Peer]
+PublicKey = <client1>
+
+[Peer]
+PublicKey = <client2>
+
+; last peer
+[LastPeer]
+PublicKey = <client3>
+`, buf.String())
+	})
+
+	t.Run("rename to itself is a no-op", func(t *testing.T) {
+		f := load(t)
+
+		err := f.RenameSectionWithIndex("Peer", 1, "Peer", false)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{DefaultSection, "Interface", "Peer", "Peer", "Peer"}, f.SectionStrings())
+		peers, err := f.SectionsByName("Peer")
+		require.NoError(t, err)
+		require.Len(t, peers, 3)
+		assert.Equal(t, "<client1>", peers[0].Key("PublicKey").String())
+		assert.Equal(t, "<client2>", peers[1].Key("PublicKey").String())
+		assert.Equal(t, "<client3>", peers[2].Key("PublicKey").String())
+
+		var buf bytes.Buffer
+		_, err = f.WriteTo(&buf)
+		require.NoError(t, err)
+		assert.Equal(t, input, buf.String())
+	})
+
+	t.Run("rename to an existing name", func(t *testing.T) {
+		t.Run("conflict when not appending", func(t *testing.T) {
+			f := load(t)
+
+			err := f.RenameSectionWithIndex("Peer", 0, "Interface", false)
+			require.Error(t, err)
+
+			// Nothing has changed
+			assert.Equal(t, []string{DefaultSection, "Interface", "Peer", "Peer", "Peer"}, f.SectionStrings())
+			peers, err := f.SectionsByName("Peer")
+			require.NoError(t, err)
+			assert.Len(t, peers, 3)
+		})
+
+		t.Run("append to the same-name group", func(t *testing.T) {
+			f := load(t)
+
+			err := f.RenameSectionWithIndex("Peer", 0, "Interface", true)
+			require.NoError(t, err)
+
+			assert.Equal(t, []string{DefaultSection, "Interface", "Interface", "Peer", "Peer"}, f.SectionStrings())
+
+			// The renamed section is appended to the existing group
+			secs, err := f.SectionsByName("Interface")
+			require.NoError(t, err)
+			require.Len(t, secs, 2)
+			assert.Equal(t, "192.168.2.1", secs[0].Key("Address").String())
+			assert.Equal(t, "<client1>", secs[1].Key("PublicKey").String())
+			assert.Equal(t, "<client1>", f.SectionWithIndex("Interface", 1).Key("PublicKey").String())
+
+			// The relative order of the remaining instances is unchanged
+			peers, err := f.SectionsByName("Peer")
+			require.NoError(t, err)
+			require.Len(t, peers, 2)
+			assert.Equal(t, "<client2>", peers[0].Key("PublicKey").String())
+			assert.Equal(t, "<client3>", peers[1].Key("PublicKey").String())
+
+			var buf bytes.Buffer
+			_, err = f.WriteTo(&buf)
+			require.NoError(t, err)
+			assert.Equal(t, `[Interface]
+Address = 192.168.2.1
+
+; first peer
+[Interface]
+PublicKey = <client1>
+
+[Peer]
+PublicKey = <client2>
+
+; last peer
+[Peer]
+PublicKey = <client3>
+`, buf.String())
+		})
+	})
+
+	t.Run("child sections stay consistent", func(t *testing.T) {
+		f, err := LoadSources(LoadOptions{
+			AllowNonUniqueSections: true,
+		}, []byte(`[app]
+[app.child]
+k = 1
+
+[app.child]
+k = 2
+
+[other]
+`))
+		require.NoError(t, err)
+		require.NotNil(t, f)
+
+		err = f.RenameSectionWithIndex("app.child", 1, "other.child", false)
+		require.NoError(t, err)
+
+		children := f.ChildSections("app")
+		require.Len(t, children, 1)
+		assert.Equal(t, "1", children[0].Key("k").String())
+
+		children = f.ChildSections("other")
+		require.Len(t, children, 1)
+		assert.Equal(t, "other.child", children[0].Name())
+		assert.Equal(t, "2", children[0].Key("k").String())
+	})
+
+	t.Run("insensitive mode does not create ghost groups", func(t *testing.T) {
+		f, err := LoadSources(LoadOptions{
+			InsensitiveSections:    true,
+			AllowNonUniqueSections: true,
+		}, []byte(`[Server]
+host = a
+
+[PEER]
+key = 1
+
+[Peer]
+key = 2
+`))
+		require.NoError(t, err)
+		require.NotNil(t, f)
+
+		// Renaming to itself with different casing is a no-op
+		err = f.RenameSectionWithIndex("PEER", 0, "Peer", false)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"default", "server", "peer", "peer"}, f.SectionStrings())
+
+		// Renaming to an existing name with different casing joins the same group
+		err = f.RenameSectionWithIndex("Peer", 1, "SERVER", true)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"default", "server", "peer", "server"}, f.SectionStrings())
+
+		secs, err := f.SectionsByName("Server")
+		require.NoError(t, err)
+		require.Len(t, secs, 2)
+		assert.Equal(t, "a", secs[0].Key("host").String())
+		assert.Equal(t, "2", secs[1].Key("key").String())
+
+		peers, err := f.SectionsByName("PEER")
+		require.NoError(t, err)
+		require.Len(t, peers, 1)
+		assert.Equal(t, "1", peers[0].Key("key").String())
+
+		var buf bytes.Buffer
+		_, err = f.WriteTo(&buf)
+		require.NoError(t, err)
+		assert.Equal(t, `[server]
+host = a
+
+[peer]
+key = 1
+
+[server]
+key = 2
+`, buf.String())
+	})
+
+	t.Run("error cases", func(t *testing.T) {
+		f := load(t)
+
+		err := f.RenameSectionWithIndex("Peer", 0, "", false)
+		require.Error(t, err)
+
+		err = f.RenameSectionWithIndex("Peer", 3, "NewPeer", false)
+		require.Error(t, err)
+
+		err = f.RenameSectionWithIndex("Peer", -1, "NewPeer", false)
+		require.Error(t, err)
+
+		err = f.RenameSectionWithIndex("NotExists", 0, "NewPeer", false)
+		require.Error(t, err)
+
+		// Non-zero index requires non-unique sections to be enabled
+		f, err = Load([]byte(`[Peer]
+PublicKey = <client1>
+`))
+		require.NoError(t, err)
+		err = f.RenameSectionWithIndex("Peer", 1, "NewPeer", false)
+		require.Error(t, err)
+
+		// But renaming the only instance works
+		err = f.RenameSectionWithIndex("Peer", 0, "NewPeer", false)
+		require.NoError(t, err)
+		assert.Equal(t, []string{DefaultSection, "NewPeer"}, f.SectionStrings())
+		assert.Equal(t, "<client1>", f.Section("NewPeer").Key("PublicKey").String())
+	})
+}
+
 func TestFile_NewRawSection(t *testing.T) {
 	f := Empty()
 	require.NotNil(t, f)

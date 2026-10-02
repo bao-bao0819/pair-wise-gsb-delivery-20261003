@@ -287,6 +287,85 @@ func (f *File) DeleteSectionWithIndex(name string, index int) error {
 	return nil
 }
 
+// RenameSectionWithIndex renames the section with given name and index to the
+// new name. The section keeps its position in the file along with its comment
+// and keys, and the relative order of other sections with the same name is
+// unchanged. When a section with the new name already exists, appendToExisting
+// determines whether the renamed section is appended to the group of sections
+// with the same name (true) or an error is returned (false).
+// Renaming a section to its current name is a no-op.
+func (f *File) RenameSectionWithIndex(name string, index int, newName string, appendToExisting bool) error {
+	if !f.options.AllowNonUniqueSections && index != 0 {
+		return fmt.Errorf("rename section with non-zero index is only allowed when non-unique sections is enabled")
+	}
+
+	if len(newName) == 0 {
+		return errors.New("empty section name")
+	}
+	if len(name) == 0 {
+		name = DefaultSection
+	}
+	if f.options.Insensitive || f.options.InsensitiveSections {
+		name = strings.ToLower(name)
+		newName = strings.ToLower(newName)
+	}
+
+	if f.BlockMode {
+		f.lock.Lock()
+		defer f.lock.Unlock()
+	}
+
+	// Locate the position of the index-th occurrence of the section name.
+	pos := -1
+	occurrences := 0
+	for i, s := range f.sectionList {
+		if s != name {
+			continue
+		}
+		if occurrences == index {
+			pos = i
+			break
+		}
+		occurrences++
+	}
+	if pos == -1 {
+		return fmt.Errorf("section %q with index %d does not exist", name, index)
+	}
+
+	if newName == name {
+		// Renaming to the current name is a no-op.
+		return nil
+	}
+
+	if !appendToExisting && len(f.sections[newName]) > 0 {
+		return fmt.Errorf("section %q already exists", newName)
+	}
+
+	// Detach the section from its current name group.
+	sec := f.sections[name][index]
+	if len(f.sections[name]) <= 1 {
+		delete(f.sections, name)
+	} else {
+		f.sections[name] = append(f.sections[name][:index], f.sections[name][index+1:]...)
+	}
+
+	// Attach the section to the group of the new name.
+	sec.name = newName
+	f.sections[newName] = append(f.sections[newName], sec)
+
+	// Fix the indices of all following sections with the old name, then update
+	// the renamed section in-place to keep its position in the file.
+	for i := pos + 1; i < len(f.sectionList); i++ {
+		if f.sectionList[i] == name {
+			f.sectionIndexes[i]--
+		}
+	}
+	f.sectionList[pos] = newName
+	f.sectionIndexes[pos] = len(f.sections[newName]) - 1
+
+	return nil
+}
+
 func (f *File) reload(s dataSource) error {
 	r, err := s.ReadCloser()
 	if err != nil {
