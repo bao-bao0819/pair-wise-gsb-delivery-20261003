@@ -227,3 +227,54 @@ type SMSProviderConfig struct {
 
 Also, envconfig will use a `Set(string) error` method like from the
 [flag.Value](https://godoc.org/flag#Value) interface if implemented.
+
+## Validation
+
+Any struct (or individual field) that implements the `envconfig.Validator`
+interface gets an optional cross-field check:
+
+```Go
+type Validator interface {
+    Validate() error
+}
+```
+
+After all fields have been converted &mdash; including default values and
+values produced by custom `Decoder`s &mdash; `Validate` is called on every
+implementing instance in inside-out order, so nested and embedded structs are
+validated before the structs that contain them. Each instance is validated at
+most once.
+
+This makes constraints that span multiple fields, such as port ranges tied to
+a particular mode or certificate/key pairs that must appear together,
+straightforward:
+
+```Go
+type TLSConfig struct {
+    Mode     string
+    Port     int
+    CertFile string
+    KeyFile  string
+}
+
+func (c *TLSConfig) Validate() error {
+    switch c.Mode {
+    case "http", "https":
+    default:
+        return fmt.Errorf("unsupported mode %q", c.Mode)
+    }
+    if c.Port < 1 || c.Port > 65535 {
+        return fmt.Errorf("port %d out of range", c.Port)
+    }
+    if (c.CertFile == "") != (c.KeyFile == "") {
+        return errors.New("CertFile and KeyFile must be provided together")
+    }
+    return nil
+}
+```
+
+If a subtree fails to convert, validation of that subtree and every ancestor
+that depends on it is skipped; validation errors from independent sibling
+subtrees are still collected together. All reported errors are prefixed with
+the full dotted struct path of the failing instance (for example
+`Server.TLS: port 70000 out of range`); root-level errors carry no prefix.
