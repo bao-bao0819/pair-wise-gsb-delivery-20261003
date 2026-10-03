@@ -368,6 +368,222 @@ func TestMilterClient_AbortFlow(t *testing.T) {
 	}
 }
 
+func TestMilterClient_MacroStagesMultiMessage(t *testing.T) {
+	type snapshot struct {
+		macros  map[string]string
+		stages  map[string]Stage
+		stageOK map[string]bool
+	}
+	takeSnapshot := func(m *Modifier) snapshot {
+		s := snapshot{
+			macros:  make(map[string]string, len(m.Macros)),
+			stages:  make(map[string]Stage, len(m.Macros)),
+			stageOK: make(map[string]bool, len(m.Macros)),
+		}
+		for name := range m.Macros {
+			s.macros[name] = m.Macros[name]
+			s.stages[name], s.stageOK[name] = m.MacroStage(name)
+		}
+		return s
+	}
+
+	var heloSnaps, mailSnaps, rcptSnaps, bodySnaps []snapshot
+	var heloLeakInMail bool
+
+	mm := MockMilter{
+		ConnResp:      RespContinue,
+		HeloResp:      RespContinue,
+		MailResp:      RespContinue,
+		RcptResp:      RespContinue,
+		HdrResp:       RespContinue,
+		HdrsResp:      RespContinue,
+		BodyChunkResp: RespContinue,
+		BodyResp:      RespContinue,
+		HeloMod: func(m *Modifier) {
+			heloSnaps = append(heloSnaps, takeSnapshot(m))
+		},
+		MailMod: func(m *Modifier) {
+			mailSnaps = append(mailSnaps, takeSnapshot(m))
+			_, heloLeakInMail = m.MacroStage("tls_version")
+			// mutations of the map handed to the callback must not
+			// corrupt session state observed by later callbacks
+			m.Macros["daemon_name"] = "hacked"
+			delete(m.Macros, "mail_macro")
+		},
+		RcptMod: func(m *Modifier) {
+			rcptSnaps = append(rcptSnaps, takeSnapshot(m))
+		},
+		BodyMod: func(m *Modifier) {
+			bodySnaps = append(bodySnaps, takeSnapshot(m))
+		},
+	}
+	s := Server{
+		NewMilter: func() Milter {
+			return &mm
+		},
+		Actions: OptAddHeader | OptChangeHeader,
+	}
+	defer s.Close()
+	local, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Serve(local)
+
+	cl := NewClientWithOptions("tcp", local.Addr().String(), ClientOptions{
+		ActionMask: OptAddHeader | OptChangeHeader,
+	})
+	defer cl.Close()
+	session, err := cl.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	assertAction := func(act *Action, err error, expectCode ActionCode) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if act.Code != expectCode {
+			t.Fatal("Unexpected code:", act.Code)
+		}
+	}
+	assertMacro := func(s snapshot, name, want string) {
+		t.Helper()
+		if got, ok := s.macros[name]; !ok || got != want {
+			t.Fatalf("Macro %q: got %q (present=%v), want %q", name, got, ok, want)
+		}
+	}
+	assertNoMacro := func(s snapshot, name string) {
+		t.Helper()
+		if got, ok := s.macros[name]; ok {
+			t.Fatalf("Macro %q should not be visible, got %q", name, got)
+		}
+	}
+	assertStage := func(s snapshot, name string, want Stage) {
+		t.Helper()
+		if !s.stageOK[name] {
+			t.Fatalf("MacroStage(%q) reported not defined", name)
+		}
+		if s.stages[name] != want {
+			t.Fatalf("MacroStage(%q): got %v, want %v", name, s.stages[name], want)
+		}
+	}
+
+	// first message: connection-level macros
+	if err := session.Macros(CodeConn, "daemon_name", "mx1", "shared", "conn"); err != nil {
+		t.Fatal(err)
+	}
+	act, err := session.Conn("host", FamilyInet, 25565, "172.0.0.1")
+	assertAction(act, err, ActContinue)
+
+	// helo-stage macros
+	if err := session.Macros(CodeHelo, "tls_version", "TLSv1.3"); err != nil {
+		t.Fatal(err)
+	}
+	act, err = session.Helo("helo_host")
+	assertAction(act, err, ActContinue)
+
+	// mail-stage macros, second packet overrides values of the first one
+	if err := session.Macros(CodeMail, "mail_macro", "m1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Macros(CodeMail, "mail_macro", "m1b", "shared", "mail1"); err != nil {
+		t.Fatal(err)
+	}
+	act, err = session.Mail("from@example.org", nil)
+	assertAction(act, err, ActContinue)
+
+	// rcpt-stage macros
+	if err := session.Macros(CodeRcpt, "rcpt_macro", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	act, err = session.Rcpt("to@example.org", nil)
+	assertAction(act, err, ActContinue)
+
+	_, act, err = session.End()
+	assertAction(act, err, ActContinue)
+
+	// second message on the same connection
+	if err := session.Macros(CodeMail, "mail_macro", "m2"); err != nil {
+		t.Fatal(err)
+	}
+	act, err = session.Mail("from2@example.org", nil)
+	assertAction(act, err, ActContinue)
+
+	// end of session, but a new connection follows on the same channel
+	if err := writePacket(session.conn, &Message{Code: byte(CodeQuitNewConn)}, 0); err != nil {
+		t.Fatal(err)
+	}
+	act, err = session.Conn("host2", FamilyInet, 25566, "172.0.0.2")
+	assertAction(act, err, ActContinue)
+	act, err = session.Helo("helo2")
+	assertAction(act, err, ActContinue)
+
+	// helo callback of the first message: connection + helo stages
+	if len(heloSnaps) != 2 {
+		t.Fatal("Wrong amount of helo callbacks:", len(heloSnaps))
+	}
+	if len(heloSnaps[0].macros) != 3 {
+		t.Fatal("Wrong helo macros:", heloSnaps[0].macros)
+	}
+	assertMacro(heloSnaps[0], "daemon_name", "mx1")
+	assertMacro(heloSnaps[0], "shared", "conn")
+	assertMacro(heloSnaps[0], "tls_version", "TLSv1.3")
+	assertStage(heloSnaps[0], "daemon_name", StageConnect)
+	assertStage(heloSnaps[0], "shared", StageConnect)
+	assertStage(heloSnaps[0], "tls_version", StageHelo)
+
+	// mail callback of the first message: same-stage override wins,
+	// stage-level definition shadows the connection-level one
+	if len(mailSnaps) != 2 {
+		t.Fatal("Wrong amount of mail callbacks:", len(mailSnaps))
+	}
+	assertMacro(mailSnaps[0], "mail_macro", "m1b")
+	assertMacro(mailSnaps[0], "shared", "mail1")
+	assertMacro(mailSnaps[0], "daemon_name", "mx1")
+	assertNoMacro(mailSnaps[0], "tls_version")
+	if heloLeakInMail {
+		t.Fatal("MacroStage reported helo-stage macro in mail callback")
+	}
+	assertStage(mailSnaps[0], "mail_macro", StageMailFrom)
+	assertStage(mailSnaps[0], "shared", StageMailFrom)
+	assertStage(mailSnaps[0], "daemon_name", StageConnect)
+
+	// rcpt callback: previous stage macros must not leak, and the map
+	// mutation done in the mail callback must not corrupt session state
+	if len(rcptSnaps) != 1 {
+		t.Fatal("Wrong amount of rcpt callbacks:", len(rcptSnaps))
+	}
+	assertMacro(rcptSnaps[0], "rcpt_macro", "r1")
+	assertMacro(rcptSnaps[0], "daemon_name", "mx1")
+	assertMacro(rcptSnaps[0], "shared", "conn")
+	assertNoMacro(rcptSnaps[0], "mail_macro")
+	assertStage(rcptSnaps[0], "rcpt_macro", StageRcptTo)
+
+	// body callback: no EOM-stage macros defined, connection-level only
+	if len(bodySnaps) != 1 {
+		t.Fatal("Wrong amount of body callbacks:", len(bodySnaps))
+	}
+	assertMacro(bodySnaps[0], "daemon_name", "mx1")
+	assertNoMacro(bodySnaps[0], "mail_macro")
+	assertNoMacro(bodySnaps[0], "rcpt_macro")
+
+	// mail callback of the second message: connection-level macros survive,
+	// previous message macros are gone
+	assertMacro(mailSnaps[1], "mail_macro", "m2")
+	assertMacro(mailSnaps[1], "daemon_name", "mx1")
+	assertMacro(mailSnaps[1], "shared", "conn")
+	assertNoMacro(mailSnaps[1], "rcpt_macro")
+	assertNoMacro(mailSnaps[1], "tls_version")
+
+	// after QuitNewConn all scopes are cleared
+	if len(heloSnaps[1].macros) != 0 {
+		t.Fatal("Macros survived QuitNewConn:", heloSnaps[1].macros)
+	}
+}
+
 // TestMilterClient_ImpossibleClientDowngrade tests that the client does not downgrade to v2
 // in case of a v6 bit set in the ActionMask.
 func TestMilterClient_ImpossibleClientDowngrade(t *testing.T) {

@@ -22,8 +22,83 @@ type milterSession struct {
 	protocol OptProtocol
 	conn     net.Conn
 	headers  textproto.MIMEHeader
-	macros   map[string]string
+	macros   map[Stage]map[string]string
+	stage    Stage
 	backend  Milter
+}
+
+// stageFromMacroCode maps the command code carried by a SMFIC_MACRO packet
+// to the protocol stage the macros apply to.
+func stageFromMacroCode(code byte) (Stage, bool) {
+	switch Code(code) {
+	case CodeConn:
+		return StageConnect, true
+	case CodeHelo:
+		return StageHelo, true
+	case CodeMail:
+		return StageMailFrom, true
+	case CodeRcpt:
+		return StageRcptTo, true
+	case CodeData:
+		return StageData, true
+	case CodeEOB:
+		return StageEOM, true
+	case CodeEOH:
+		return StageEOH, true
+	}
+	return 0, false
+}
+
+// resetMacros drops all macro definitions except connection-level ones and
+// the stages listed in keep.
+func (m *milterSession) resetMacros(keep ...Stage) {
+	for stage := range m.macros {
+		if stage == StageConnect {
+			continue
+		}
+		kept := false
+		for _, k := range keep {
+			if stage == k {
+				kept = true
+				break
+			}
+		}
+		if !kept {
+			delete(m.macros, stage)
+		}
+	}
+}
+
+// mergedMacros returns a fresh map with connection-level macros merged with
+// the macros defined for the current stage. Current stage definitions take
+// precedence. The returned map is a copy and can be mutated by callers
+// without affecting session state.
+func (m *milterSession) mergedMacros() map[string]string {
+	merged := make(map[string]string)
+	for name, value := range m.macros[StageConnect] {
+		merged[name] = value
+	}
+	if m.stage != StageConnect {
+		for name, value := range m.macros[m.stage] {
+			merged[name] = value
+		}
+	}
+	return merged
+}
+
+// macroStages returns a fresh map recording the stage each visible macro
+// was defined at, using the same merge rules as mergedMacros.
+func (m *milterSession) macroStages() map[string]Stage {
+	stages := make(map[string]Stage)
+	for name := range m.macros[StageConnect] {
+		stages[name] = StageConnect
+	}
+	if m.stage != StageConnect {
+		for name := range m.macros[m.stage] {
+			stages[name] = m.stage
+		}
+	}
+	return stages
 }
 
 // ReadPacket reads incoming milter packet
@@ -102,7 +177,8 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		// abort current message and start over
 		defer func() {
 			m.headers = nil
-			m.macros = nil
+			m.resetMacros()
+			m.stage = StageConnect
 		}()
 		return nil, m.backend.Abort(newModifier(m))
 
@@ -111,6 +187,7 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		return m.backend.BodyChunk(msg.Data, newModifier(m))
 
 	case CodeConn:
+		m.stage = StageConnect
 		// new connection, get hostname
 		hostname := readCString(msg.Data)
 		msg.Data = msg.Data[len(hostname)+1:]
@@ -144,8 +221,21 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 			newModifier(m))
 
 	case CodeMacro:
-		// define macros
-		m.macros = make(map[string]string)
+		// define macros for the stage carried by the packet
+		if len(msg.Data) == 0 {
+			return nil, nil
+		}
+		stage, ok := stageFromMacroCode(msg.Data[0])
+		if !ok {
+			// ignore macros for unknown stages
+			return nil, nil
+		}
+		if m.macros == nil {
+			m.macros = make(map[Stage]map[string]string)
+		}
+		if m.macros[stage] == nil {
+			m.macros[stage] = make(map[string]string)
+		}
 		// convert data to Go strings
 		data := decodeCStrings(msg.Data[1:])
 		if len(data) != 0 {
@@ -155,17 +245,22 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 
 			// store data in a map
 			for i := 0; i < len(data); i += 2 {
-				m.macros[data[i]] = data[i+1]
+				m.macros[stage][data[i]] = data[i+1]
 			}
 		}
 		// do not send response
 		return nil, nil
 
 	case CodeEOB:
+		m.stage = StageEOM
+		// end of message: drop per-message macro scopes once the
+		// callback has run
+		defer m.resetMacros()
 		// call and return milter handler
 		return m.backend.Body(newModifier(m))
 
 	case CodeHelo:
+		m.stage = StageHelo
 		// helo command
 		name := strings.TrimSuffix(string(msg.Data), null)
 		return m.backend.Helo(name, newModifier(m))
@@ -188,11 +283,16 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		}
 
 	case CodeMail:
+		// new message in the same connection: drop macro scopes of the
+		// previous message, keeping definitions received for this stage
+		m.resetMacros(StageMailFrom)
+		m.stage = StageMailFrom
 		// envelope from address
 		from := readCString(msg.Data)
 		return m.backend.MailFrom(strings.Trim(from, "<>"), newModifier(m))
 
 	case CodeEOH:
+		m.stage = StageEOH
 		// end of headers
 		return m.backend.Headers(m.headers, newModifier(m))
 
@@ -225,13 +325,24 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		// client requested session close
 		return nil, errCloseSession
 
+	case CodeQuitNewConn:
+		// session ends but a new connection follows on the same channel:
+		// reset all state, including connection-level macros
+		m.headers = nil
+		m.macros = nil
+		m.stage = StageConnect
+		// do not send response
+		return nil, nil
+
 	case CodeRcpt:
+		m.stage = StageRcptTo
 		// envelope to address
 		to := readCString(msg.Data)
 		return m.backend.RcptTo(strings.Trim(to, "<>"), newModifier(m))
 
 	case CodeData:
-		// data, ignore
+		// data, only track the protocol stage
+		m.stage = StageData
 
 	default:
 		// print error and close session
@@ -276,6 +387,8 @@ func (m *milterSession) HandleMilterCommands() {
 			if !resp.Continue() {
 				// prepare backend for next message
 				m.backend = m.server.NewMilter()
+				// message is over, drop its macro scopes
+				m.resetMacros()
 			}
 		}
 	}

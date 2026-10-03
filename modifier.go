@@ -17,10 +17,22 @@ func crlfToLF(b []byte) []byte {
 // Modifier provides access to Macros, Headers and Body data to callback handlers. It also defines a
 // number of functions that can be used by callback handlers to modify processing of the email message
 type Modifier struct {
+	// Macros contains connection-level macros merged with the macros
+	// defined for the current protocol stage. It is a copy and can be
+	// modified freely.
 	Macros  map[string]string
 	Headers textproto.MIMEHeader
 
+	macroStages map[string]Stage
+
 	writePacket func(*Message) error
+}
+
+// MacroStage reports the protocol stage at which the given macro was
+// defined. The second return value is false if the macro is not defined.
+func (m *Modifier) MacroStage(name string) (Stage, bool) {
+	stage, ok := m.macroStages[name]
+	return stage, ok
 }
 
 // AddRecipient appends a new envelope recipient for current message
@@ -89,7 +101,8 @@ func (m *Modifier) ChangeFrom(value string) error {
 // newModifier creates a new Modifier instance from milterSession
 func newModifier(s *milterSession) *Modifier {
 	return &Modifier{
-		Macros:      s.macros,
+		Macros:      s.mergedMacros(),
+		macroStages: s.macroStages(),
 		Headers:     s.headers,
 		writePacket: s.WritePacket,
 	}
