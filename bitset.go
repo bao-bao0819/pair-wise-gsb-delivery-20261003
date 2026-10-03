@@ -1620,6 +1620,112 @@ func (b *BitSet) ShiftRight(bits uint) {
 	}
 }
 
+// RotateLeft cyclically rotates the bits in [start, end) to the left.
+// Bits that move past end-1 wrap around to start, and bits outside the
+// range are unchanged. If the range is empty, the rotation is a no-op.
+// It panics if start > end or end is greater than the bitset length.
+func (b *BitSet) RotateLeft(start, end, bits uint) *BitSet {
+	panicIfNull(b)
+	if start > end || end > b.length {
+		panic(Error("BitSet.RotateLeft: invalid range"))
+	}
+
+	width := end - start
+	if width == 0 || bits == 0 {
+		return b
+	}
+
+	bits %= width
+	if bits == 0 {
+		return b
+	}
+
+	b.reverseBitRange(start, end)
+	b.reverseBitRange(start, start+bits)
+	b.reverseBitRange(start+bits, end)
+
+	return b
+}
+
+// RotateRight cyclically rotates the bits in [start, end) to the right.
+// Bits that move before start wrap around to end-1, and bits outside the
+// range are unchanged. If the range is empty, the rotation is a no-op.
+// It panics if start > end or end is greater than the bitset length.
+func (b *BitSet) RotateRight(start, end, bits uint) *BitSet {
+	panicIfNull(b)
+	if start > end || end > b.length {
+		panic(Error("BitSet.RotateRight: invalid range"))
+	}
+
+	width := end - start
+	if width == 0 || bits == 0 {
+		return b
+	}
+
+	bits %= width
+	if bits == 0 {
+		return b
+	}
+
+	return b.RotateLeft(start, end, width-bits)
+}
+
+func lowBitsMask(n uint) uint64 {
+	if n == 0 {
+		return 0
+	}
+	return allBits >> (wordSize - n)
+}
+
+func (b *BitSet) bitRange(start, n uint) uint64 {
+	word := start >> log2WordSize
+	offset := start & wordMask
+	value := b.set[word] >> offset
+	if offset+n > wordSize {
+		value |= b.set[word+1] << (wordSize - offset)
+	}
+	return value & lowBitsMask(n)
+}
+
+func (b *BitSet) setBitRange(start, n uint, value uint64) {
+	word := start >> log2WordSize
+	offset := start & wordMask
+	mask := lowBitsMask(n)
+	value &= mask
+	b.set[word] = (b.set[word] &^ (mask << offset)) | (value << offset)
+
+	if offset+n > wordSize {
+		spill := offset + n - wordSize
+		spillMask := lowBitsMask(spill)
+		b.set[word+1] = (b.set[word+1] &^ spillMask) | (value >> (wordSize - offset))
+	}
+}
+
+func (b *BitSet) swapBitRanges(first, second, n uint) {
+	firstValue := bits.Reverse64(b.bitRange(first, n)) >> (wordSize - n)
+	secondValue := bits.Reverse64(b.bitRange(second, n)) >> (wordSize - n)
+	b.setBitRange(first, n, secondValue)
+	b.setBitRange(second, n, firstValue)
+}
+
+func (b *BitSet) reverseBitRange(start, end uint) {
+	width := end - start
+	remaining := width
+	for left := uint(0); remaining >= 2; {
+		chunkSize := uint(wordSize)
+		if remaining < 2*wordSize {
+			chunkSize = remaining / 2
+		}
+		if chunkSize == 0 {
+			break
+		}
+
+		b.swapBitRanges(start+left, end-left-chunkSize, chunkSize)
+		left += chunkSize
+		remaining -= 2 * chunkSize
+	}
+}
+
 // OnesBetween returns the number of set bits in the range [from, to).
 // The range is inclusive of 'from' and exclusive of 'to'.
 // Returns 0 if from >= to.

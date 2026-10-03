@@ -2543,6 +2543,192 @@ func TestShiftRightFull(t *testing.T) {
 	}
 }
 
+func rotateBitsNaive(values []bool, rotation uint, left bool) []bool {
+	result := make([]bool, len(values))
+	rotation %= uint(len(values))
+	for i, value := range values {
+		destination := uint(i) + rotation
+		if !left {
+			destination = uint(i) + uint(len(values)) - rotation
+		}
+		result[destination%uint(len(values))] = value
+	}
+	return result
+}
+
+func TestRangeRotate(t *testing.T) {
+	starts := []uint{0, 1, 5, 31, 32, 61, 63, 64, 65}
+	widths := []uint{1, 2, 3, 7, 31, 32, 33, 63, 64, 65, 127, 128, 129, 193, 256}
+
+	for _, start := range starts {
+		for _, width := range widths {
+			end := start + width
+			bitsetLength := end + 37
+			if end+37 < 256 {
+				bitsetLength = 256
+			}
+
+			b := New(bitsetLength)
+			originalWindow := make([]bool, width)
+			originalOutside := make([]bool, bitsetLength)
+			for i := uint(0); i < bitsetLength; i++ {
+				value := i%3 == 0 || i%7 == 2 || i%13 == 5
+				if value {
+					b.Set(i)
+				}
+				originalOutside[i] = value
+				if i >= start && i < end {
+					originalWindow[i-start] = value
+				}
+			}
+
+			for _, rotation := range []uint{0, 1, 2, width - 1, width, width + 1, width*2 + 17} {
+				name := fmt.Sprintf("start=%d/width=%d/rotation=%d", start, width, rotation)
+				t.Run(name, func(t *testing.T) {
+					for _, left := range []bool{true, false} {
+						rotated := b.Clone()
+						if left {
+							rotated.RotateLeft(start, end, rotation)
+						} else {
+							rotated.RotateRight(start, end, rotation)
+						}
+
+						wantWindow := rotateBitsNaive(originalWindow, rotation, left)
+						for i := uint(0); i < bitsetLength; i++ {
+							want := originalOutside[i]
+							if i >= start && i < end {
+								want = wantWindow[i-start]
+							}
+
+							if rotated.Test(i) != want {
+								t.Fatalf("left=%v: bit %d = %v, want %v", left, i, rotated.Test(i), want)
+							}
+						}
+
+						inverse := rotated.Clone()
+						if left {
+							inverse.RotateRight(start, end, rotation)
+						} else {
+							inverse.RotateLeft(start, end, rotation)
+						}
+
+						if !inverse.Equal(b) {
+							t.Fatalf("left=%v: inverse rotation did not restore the original bitset", left)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRangeRotateCrossWordCarry(t *testing.T) {
+	const start = uint(61)
+	const end = uint(197)
+	const width = end - start
+
+	b := New(256)
+	setBits := []uint{61, 62, 63, 64, 65, 125, 126, 127, 128, 129, 193, 194, 195, 196, 200}
+	for _, i := range setBits {
+		b.Set(i)
+	}
+
+	b.RotateLeft(start, end, 7)
+
+	wantMoved := map[uint]struct{}{
+		64:  {},
+		65:  {},
+		66:  {},
+		67:  {},
+		68:  {},
+		69:  {},
+		70:  {},
+		71:  {},
+		72:  {},
+		132: {},
+		133: {},
+		134: {},
+		135: {},
+		136: {},
+	}
+
+	for i := uint(0); i < 256; i++ {
+		want := i == 200
+		if _, ok := wantMoved[i]; ok {
+			want = true
+		}
+		if b.Test(i) != want {
+			t.Fatalf("bit %d = %v, want %v", i, b.Test(i), want)
+		}
+	}
+
+	b.RotateRight(start, end, 7)
+	for _, i := range setBits {
+		if !b.Test(i) {
+			t.Fatalf("bit %d was not restored", i)
+		}
+	}
+	if b.Count() != uint(len(setBits)) {
+		t.Fatalf("count = %d, want %d", b.Count(), len(setBits))
+	}
+	if width != 136 {
+		t.Fatalf("test window width = %d, want 136", width)
+	}
+}
+
+func TestRangeRotateEmptyWindow(t *testing.T) {
+	b := New(128)
+	b.Set(10).Set(20)
+	original := b.Clone()
+
+	b.RotateLeft(32, 32, 1)
+	b.RotateRight(32, 32, 1)
+
+	if !b.Equal(original) {
+		t.Fatal("rotating an empty window changed the bitset")
+	}
+}
+
+func TestRangeRotateInvalidRange(t *testing.T) {
+	invalidCases := []struct {
+		name  string
+		start uint
+		end   uint
+	}{
+		{"start after end", 10, 9},
+		{"end past length", 0, 65},
+		{"start past length", 65, 65},
+	}
+
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, left := range []bool{true, false} {
+				b := New(64)
+				b.Set(10).Set(20)
+				original := b.Clone()
+
+				func() {
+					defer func() {
+						if recover() == nil {
+							t.Fatal("expected a panic")
+						}
+					}()
+
+					if left {
+						b.RotateLeft(tc.start, tc.end, 1)
+					} else {
+						b.RotateRight(tc.start, tc.end, 1)
+					}
+				}()
+
+				if !b.Equal(original) {
+					t.Fatal("invalid range partially modified the bitset")
+				}
+			}
+		})
+	}
+}
+
 func TestWord(t *testing.T) {
 	data := []uint64{0x0bfd85fc01af96dd, 0x3fe212a7eae11414, 0x7aa412221245dee1, 0x557092c1711306d5}
 	testCases := map[string]struct {
