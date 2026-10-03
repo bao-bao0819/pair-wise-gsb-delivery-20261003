@@ -61,15 +61,15 @@ var testCases = []struct {
 	{File: "tests/tc30.ber", Error: ""},
 	{File: "tests/tc31.ber", Error: errEOF},
 	{File: "tests/tc32.ber", Error: ""},
-	// Bit string (some expected failures are disabled until support is added)
-	{File: "tests/tc33.ber", Error: ""}, // Error: "Too big value for "unused bits""
+	// Bit string
+	{File: "tests/tc33.ber", Error: "bit string unused-bits count 15 out of range 0-7"},
 	{File: "tests/tc34.ber", Error: errEOF},
-	{File: "tests/tc35.ber", Error: "", IndefiniteEncoding: true}, // Error: "Using of different from BIT STRING types as internal types for constructive encoding"
-	{File: "tests/tc36.ber", Error: "", IndefiniteEncoding: true}, // Error: "Using of "unused bits" in internal BIT STRINGs with constructive form of encoding"
-	{File: "tests/tc37.ber", Error: ""},
+	{File: "tests/tc35.ber", Error: "constructed bit string child is not a universal bit string (class 0, tag 4)"},
+	{File: "tests/tc36.ber", Error: "bit string has non-zero bits in the 4 unused trailing bits"},
+	{File: "tests/tc37.ber", Error: "bit string has non-zero bits in the 4 unused trailing bits"},
 	{File: "tests/tc38.ber", Error: "", IndefiniteEncoding: true},
 	{File: "tests/tc39.ber", Error: ""},
-	{File: "tests/tc40.ber", Error: ""},
+	{File: "tests/tc40.ber", Error: "bit string content missing unused-bits byte"},
 	// Octet string (some expected failures are disabled until support is added)
 	{File: "tests/tc41.ber", Error: "", IndefiniteEncoding: true}, // Error: "Using of different from OCTET STRING types as internal types for constructive encoding"
 	{File: "tests/tc42.ber", Error: errEOF},
@@ -79,7 +79,7 @@ var testCases = []struct {
 	// Bit string
 	{File: "tests/tc46.ber", Error: "indefinite length used with primitive type"},
 	{File: "tests/tc47.ber", Error: "eoc child not allowed with definite length"},
-	{File: "tests/tc48.ber", Error: "", IndefiniteEncoding: true}, // Error: "Using of more than 7 "unused bits" in BIT STRING with constrictive encoding form"
+	{File: "tests/tc48.ber", Error: "bit string unused-bits count 15 out of range 0-7"},
 	{File: "tests/tc49.ber", Error: ""},
 	{File: "tests/tc50.ber", Error: "long-form length overflow"},
 	{File: "tests/tc51.ber", Error: is64bit(fmt.Sprintf("length 206966894640 greater than maximum %v", MaxPacketLengthBytes), "long-form length overflow")},

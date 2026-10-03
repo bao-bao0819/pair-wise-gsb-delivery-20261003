@@ -386,6 +386,16 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 			// Append and continue
 			p.AppendChild(child)
 		}
+
+		if p.ClassType == ClassUniversal && p.Tag == TagBitString {
+			var bv BitStringValue
+			bv, err = flattenBitString(p)
+			if err != nil {
+				return nil, read, err
+			}
+			p.Value = bv
+		}
+
 		return p, read, nil
 	}
 
@@ -424,6 +434,10 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 		case TagInteger:
 			p.Value, err = ParseInt64(content)
 		case TagBitString:
+			var bv BitStringValue
+			if bv, err = ParseBitString(content); err == nil {
+				p.Value = bv
+			}
 		case TagOctetString:
 			// the actual string encoding is not known here
 			// (e.g. for LDAP content is already an UTF8-encoded
