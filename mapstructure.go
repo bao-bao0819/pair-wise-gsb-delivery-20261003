@@ -386,6 +386,7 @@ type DecoderConfig struct {
 type Decoder struct {
 	config           *DecoderConfig
 	cachedDecodeHook func(from reflect.Value, to reflect.Value) (any, error)
+	unused           *unusedInputTracker
 }
 
 // Metadata contains information about decoding a structure that
@@ -402,6 +403,332 @@ type Metadata struct {
 	// but weren't set in the decoding process since there was no matching value
 	// in the input
 	Unset []string
+
+	// UnusedInput is a tree of the parts of the input that were not consumed
+	// by the decoding process. It preserves the hierarchy of the original
+	// input: nested maps become nested maps and arrays become slices, with
+	// only the unknown portions retained. Keys and values keep their original
+	// types, including non-string map keys.
+	//
+	// Values collected by a field tagged with ",remain" are considered
+	// consumed and do not appear here.
+	//
+	// The tree is built from independent copies, so mutating it never affects
+	// the original input.
+	UnusedInput any
+}
+
+// unusedKind discriminates the kind of input container an unusedInputFrame
+// mirrors.
+type unusedKind int
+
+const (
+	unusedMap unusedKind = iota
+	unusedSeq
+)
+
+// unusedInputFrame mirrors one level of the input tree while it is being
+// decoded. For a map frame, every input key is recorded in keys until it is
+// proven consumed. For a sequence frame, every input index is recorded in
+// indices until its element is proven consumed.
+//
+// pendingKey/pendingIndex identify the input location of the value currently
+// being decoded by the direct child frame, so that nested leftovers can be
+// attached at the exact right place without dot-name parsing.
+type unusedInputFrame struct {
+	kind            unusedKind
+	parent          *unusedInputFrame
+	keys            map[any]reflect.Value
+	keyOrder        []any
+	leftoverKeys    map[any]bool
+	indices         map[int]reflect.Value
+	leftoverIndices map[int]bool
+	seqLen          int
+	pendingKey      any
+	pendingIndex    int
+}
+
+// unusedInputTracker holds the stack of frames active during a single
+// Decode call.
+type unusedInputTracker struct {
+	frames []*unusedInputFrame
+	root   any
+}
+
+func newUnusedInputTracker() *unusedInputTracker {
+	return &unusedInputTracker{}
+}
+
+// popRoot finishes any frames still active (for example when decoding
+// returned an error) and returns the leftover tree mirrored by the root
+// frame, or nil when the whole input was consumed.
+func (t *unusedInputTracker) popRoot() any {
+	// Unwind from the innermost frame so that nested leftovers are attached
+	// to their parents before the root frame is finished.
+	for len(t.frames) > 0 {
+		frame := t.frames[len(t.frames)-1]
+		t.pop(frame)
+	}
+	return t.root
+}
+
+func (t *unusedInputTracker) top() *unusedInputFrame {
+	if len(t.frames) == 0 {
+		return nil
+	}
+	return t.frames[len(t.frames)-1]
+}
+
+// pushMap starts tracking a map input. dataVal is the input map and mapKeys
+// is the set of keys the caller is interested in; when nil all of the map's
+// keys start out unconsumed.
+func (t *unusedInputTracker) pushMap(dataVal reflect.Value, mapKeys map[reflect.Value]struct{}) *unusedInputFrame {
+	frame := &unusedInputFrame{
+		kind:   unusedMap,
+		parent: t.top(),
+		keys:   make(map[any]reflect.Value),
+	}
+	if mapKeys != nil {
+		for key := range mapKeys {
+			rawKey := key.Interface()
+			frame.keys[rawKey] = dataVal.MapIndex(key)
+			frame.keyOrder = append(frame.keyOrder, rawKey)
+		}
+	} else {
+		for _, key := range dataVal.MapKeys() {
+			rawKey := key.Interface()
+			frame.keys[rawKey] = dataVal.MapIndex(key)
+			frame.keyOrder = append(frame.keyOrder, rawKey)
+		}
+	}
+	t.frames = append(t.frames, frame)
+	return frame
+}
+
+// pushSeq starts tracking a sequence input.
+func (t *unusedInputTracker) pushSeq(length int) *unusedInputFrame {
+	frame := &unusedInputFrame{
+		kind:    unusedSeq,
+		parent:  t.top(),
+		indices: make(map[int]reflect.Value, length),
+		seqLen:  length,
+	}
+	t.frames = append(t.frames, frame)
+	return frame
+}
+
+// setSeqValue records the original input value at an unconsumed sequence
+// index.
+func (t *unusedInputTracker) setSeqValue(index int, value reflect.Value) {
+	if frame := t.top(); frame != nil && frame.kind == unusedSeq {
+		if _, ok := frame.indices[index]; !ok {
+			frame.indices[index] = value
+		}
+	}
+}
+
+// setPendingKey marks the input key whose value is about to be decoded by a
+// direct child frame.
+func (t *unusedInputTracker) setPendingKey(key any) {
+	if frame := t.top(); frame != nil && frame.kind == unusedMap {
+		frame.pendingKey = key
+	}
+}
+
+// setPendingIndex marks the input index whose element is about to be decoded
+// by a direct child frame.
+func (t *unusedInputTracker) setPendingIndex(index int) {
+	if frame := t.top(); frame != nil && frame.kind == unusedSeq {
+		frame.pendingIndex = index
+	}
+}
+
+// consumeKey marks a map key as consumed.
+func (t *unusedInputTracker) consumeKey(key any) {
+	if frame := t.top(); frame != nil {
+		delete(frame.keys, key)
+	}
+}
+
+// consumeIndex marks a sequence element as consumed.
+func (t *unusedInputTracker) consumeIndex(index int) {
+	if frame := t.top(); frame != nil {
+		delete(frame.indices, index)
+	}
+}
+
+// consumeAll marks every still-tracked location as consumed; it is used when
+// a ",remain" field takes ownership of all leftovers.
+func (t *unusedInputTracker) consumeAll() {
+	if frame := t.top(); frame != nil {
+		frame.keys = nil
+		frame.indices = nil
+	}
+}
+
+// pop finishes a frame, building its leftover tree. A non-empty result is
+// attached to the parent frame at the location the parent recorded before
+// the value was decoded; a root frame's result is captured for popRoot.
+// Empty frames are pruned.
+func (t *unusedInputTracker) pop(frame *unusedInputFrame) any {
+	top := t.top()
+	if top != nil && top == frame {
+		t.frames = t.frames[:len(t.frames)-1]
+	}
+
+	result := frame.result()
+	if result == nil {
+		return nil
+	}
+
+	parent := frame.parent
+	if parent == nil {
+		t.root = copyUnusedValue(reflect.ValueOf(result)).Interface()
+		return nil
+	}
+
+	switch parent.kind {
+	case unusedMap:
+		if parent.keys != nil {
+			if _, ok := parent.keys[parent.pendingKey]; ok {
+				parent.keys[parent.pendingKey] = reflect.ValueOf(result)
+				if parent.leftoverKeys == nil {
+					parent.leftoverKeys = make(map[any]bool)
+				}
+				parent.leftoverKeys[parent.pendingKey] = true
+			}
+		}
+	case unusedSeq:
+		if _, ok := parent.indices[parent.pendingIndex]; ok {
+			parent.indices[parent.pendingIndex] = reflect.ValueOf(result)
+			if parent.leftoverIndices == nil {
+				parent.leftoverIndices = make(map[int]bool)
+			}
+			parent.leftoverIndices[parent.pendingIndex] = true
+		}
+	}
+
+	return nil
+}
+
+// result builds the leftover tree mirrored by the frame. A fully consumed
+// frame returns nil so that empty containers are pruned.
+func (f *unusedInputFrame) result() any {
+	switch f.kind {
+	case unusedMap:
+		if len(f.keys) == 0 {
+			return nil
+		}
+
+		allStringKeys := true
+		for key := range f.keys {
+			if _, ok := key.(string); !ok {
+				allStringKeys = false
+				break
+			}
+		}
+
+		if allStringKeys {
+			result := make(map[string]any, len(f.keys))
+			for _, key := range f.keyOrder {
+				if value, ok := f.keys[key]; ok {
+					result[key.(string)] = value.Interface()
+				}
+			}
+			return result
+		}
+
+		result := make(map[any]any, len(f.keys))
+		for _, key := range f.keyOrder {
+			if value, ok := f.keys[key]; ok {
+				result[key] = value.Interface()
+			}
+		}
+		return result
+
+	case unusedSeq:
+		if len(f.indices) == 0 {
+			return nil
+		}
+
+		result := make([]any, f.seqLen)
+		for index, value := range f.indices {
+			if value.IsValid() {
+				result[index] = value.Interface()
+			}
+		}
+		return result
+	}
+
+	return nil
+}
+
+// unusedKeyString renders a map key for flat key lists and error messages
+// without assuming it is a string.
+func unusedKeyString(key any) string {
+	if s, ok := key.(string); ok {
+		return s
+	}
+	return fmt.Sprint(key)
+}
+
+// copyUnusedValue returns an independent deep copy of a leftover-tree value.
+// Scalar values are immutable and returned as-is; maps, slices, arrays,
+// pointers and interfaces are duplicated recursively.
+func copyUnusedValue(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return value
+		}
+		return copyUnusedValue(value.Elem())
+
+	case reflect.Ptr:
+		if value.IsNil() {
+			return value
+		}
+		duplicate := reflect.New(value.Elem().Type())
+		duplicate.Elem().Set(copyUnusedValue(value.Elem()))
+		return duplicate
+
+	case reflect.Map:
+		if value.IsNil() {
+			return value
+		}
+		duplicate := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iterator := value.MapRange()
+		for iterator.Next() {
+			duplicate.SetMapIndex(
+				copyUnusedValue(iterator.Key()),
+				copyUnusedValue(iterator.Value()),
+			)
+		}
+		return duplicate
+
+	case reflect.Slice:
+		if value.IsNil() {
+			return value
+		}
+		duplicate := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for i := 0; i < value.Len(); i++ {
+			duplicate.Index(i).Set(copyUnusedValue(value.Index(i)))
+		}
+		return duplicate
+
+	case reflect.Array:
+		duplicate := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			duplicate.Index(i).Set(copyUnusedValue(value.Index(i)))
+		}
+		return duplicate
+
+	default:
+		return value
+	}
 }
 
 // Decode takes an input structure and uses reflection to translate it to
@@ -523,6 +850,9 @@ func NewDecoder(config *DecoderConfig) (*Decoder, error) {
 	if config.DecodeHook != nil {
 		result.cachedDecodeHook = cachedDecodeHook(config.DecodeHook)
 	}
+	if config.Metadata != nil {
+		result.unused = newUnusedInputTracker()
+	}
 
 	return result, nil
 }
@@ -530,7 +860,16 @@ func NewDecoder(config *DecoderConfig) (*Decoder, error) {
 // Decode decodes the given raw interface to the target pointer specified
 // by the configuration.
 func (d *Decoder) Decode(input any) error {
+	if d.unused != nil {
+		d.unused.frames = nil
+		d.unused.root = nil
+	}
+
 	err := d.decode(d.config.RootName, input, reflect.ValueOf(d.config.Result).Elem())
+
+	if d.config.Metadata != nil && d.unused != nil {
+		d.config.Metadata.UnusedInput = d.unused.popRoot()
+	}
 
 	// Retain some of the original behavior when multiple errors ocurr
 	var joinedErr interface{ Unwrap() []error }
@@ -1065,6 +1404,16 @@ func (d *Decoder) decodeMapFromSlice(name string, dataVal reflect.Value, val ref
 		return nil
 	}
 
+	// Slice-to-map decoding is a weakly typed fallback whose elements never
+	// map to individual input locations; a barrier frame keeps any nested
+	// leftovers from attaching to a stale pending location of the caller.
+	trackingUnused := d.unused != nil
+	var unusedFrame *unusedInputFrame
+	if trackingUnused {
+		unusedFrame = d.unused.pushSeq(dataVal.Len())
+		d.unused.consumeAll()
+	}
+
 	for i := 0; i < dataVal.Len(); i++ {
 		err := d.decode(
 			name+"["+strconv.Itoa(i)+"]",
@@ -1072,6 +1421,10 @@ func (d *Decoder) decodeMapFromSlice(name string, dataVal reflect.Value, val ref
 		if err != nil {
 			return err
 		}
+	}
+
+	if trackingUnused {
+		d.unused.pop(unusedFrame)
 	}
 
 	return nil
@@ -1085,8 +1438,17 @@ func (d *Decoder) decodeMapFromMap(name string, dataVal reflect.Value, val refle
 	// Accumulate errors
 	var errs []error
 
+	trackingUnused := d.unused != nil
+	var unusedFrame *unusedInputFrame
+	if trackingUnused {
+		unusedFrame = d.unused.pushMap(dataVal, nil)
+	}
+
 	// If the input data is empty, then we just match what the input data is.
 	if dataVal.Len() == 0 {
+		if trackingUnused {
+			d.unused.pop(unusedFrame)
+		}
 		if dataVal.IsNil() {
 			if !val.IsNil() {
 				val.Set(dataVal)
@@ -1101,27 +1463,44 @@ func (d *Decoder) decodeMapFromMap(name string, dataVal reflect.Value, val refle
 
 	for _, k := range dataVal.MapKeys() {
 		fieldName := name + "[" + k.String() + "]"
+		rawInputKey := k.Interface()
 
 		// First decode the key into the proper type
 		currentKey := reflect.Indirect(reflect.New(valKeyType))
 		if err := d.decode(fieldName, k.Interface(), currentKey); err != nil {
 			errs = append(errs, err)
+			if trackingUnused {
+				d.unused.consumeKey(rawInputKey)
+			}
 			continue
 		}
 
 		// Next decode the data into the proper type
 		v := dataVal.MapIndex(k).Interface()
 		currentVal := reflect.Indirect(reflect.New(valElemType))
+		if trackingUnused {
+			d.unused.setPendingKey(rawInputKey)
+		}
 		if err := d.decode(fieldName, v, currentVal); err != nil {
 			errs = append(errs, err)
+			if trackingUnused {
+				d.unused.consumeKey(rawInputKey)
+			}
 			continue
 		}
 
 		valMap.SetMapIndex(currentKey, currentVal)
+		if trackingUnused && !unusedFrame.leftoverKeys[rawInputKey] {
+			d.unused.consumeKey(rawInputKey)
+		}
 	}
 
 	// Set the built up map to the value
 	val.Set(valMap)
+
+	if trackingUnused {
+		d.unused.pop(unusedFrame)
+	}
 
 	return errors.Join(errs...)
 }
@@ -1408,6 +1787,12 @@ func (d *Decoder) decodeSlice(name string, data any, val reflect.Value) error {
 		return nil
 	}
 
+	trackingUnused := d.unused != nil
+	var unusedFrame *unusedInputFrame
+	if trackingUnused {
+		unusedFrame = d.unused.pushSeq(dataVal.Len())
+	}
+
 	valSlice := val
 	if valSlice.IsNil() || d.config.ZeroFields {
 		// Make a new slice to hold our result, same size as the original data.
@@ -1427,13 +1812,28 @@ func (d *Decoder) decodeSlice(name string, data any, val reflect.Value) error {
 		currentField := valSlice.Index(i)
 
 		fieldName := name + "[" + strconv.Itoa(i) + "]"
+		if trackingUnused {
+			d.unused.setSeqValue(i, dataVal.Index(i))
+			d.unused.setPendingIndex(i)
+		}
 		if err := d.decode(fieldName, currentData, currentField); err != nil {
 			errs = append(errs, err)
+			if trackingUnused {
+				d.unused.consumeIndex(i)
+			}
+			continue
+		}
+		if trackingUnused && !unusedFrame.leftoverIndices[i] {
+			d.unused.consumeIndex(i)
 		}
 	}
 
 	// Finally, set the value to the slice we built up
 	val.Set(valSlice)
+
+	if trackingUnused {
+		d.unused.pop(unusedFrame)
+	}
 
 	return errors.Join(errs...)
 }
@@ -1483,18 +1883,39 @@ func (d *Decoder) decodeArray(name string, data any, val reflect.Value) error {
 	// Accumulate any errors
 	var errs []error
 
+	trackingUnused := d.unused != nil
+	var unusedFrame *unusedInputFrame
+	if trackingUnused {
+		unusedFrame = d.unused.pushSeq(dataVal.Len())
+	}
+
 	for i := 0; i < dataVal.Len(); i++ {
 		currentData := dataVal.Index(i).Interface()
 		currentField := valArray.Index(i)
 
 		fieldName := name + "[" + strconv.Itoa(i) + "]"
+		if trackingUnused {
+			d.unused.setSeqValue(i, dataVal.Index(i))
+			d.unused.setPendingIndex(i)
+		}
 		if err := d.decode(fieldName, currentData, currentField); err != nil {
 			errs = append(errs, err)
+			if trackingUnused {
+				d.unused.consumeIndex(i)
+			}
+			continue
+		}
+		if trackingUnused && !unusedFrame.leftoverIndices[i] {
+			d.unused.consumeIndex(i)
 		}
 	}
 
 	// Finally, set the value to the array we built up
 	val.Set(valArray)
+
+	if trackingUnused {
+		d.unused.pop(unusedFrame)
+	}
 
 	return errors.Join(errs...)
 }
@@ -1555,6 +1976,12 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 	for _, dataValKey := range dataVal.MapKeys() {
 		dataValKeys[dataValKey] = struct{}{}
 		dataValKeysUnused[dataValKey.Interface()] = struct{}{}
+	}
+
+	trackingUnused := d.unused != nil
+	var unusedFrame *unusedInputFrame
+	if trackingUnused {
+		unusedFrame = d.unused.pushMap(dataVal, dataValKeys)
 	}
 
 	targetValKeysUnused := make(map[any]struct{})
@@ -1709,8 +2136,13 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			continue
 		}
 
+		rawInputKey := rawMapKey.Interface()
+
 		// Delete the key we're using from the unused map so we stop tracking
-		delete(dataValKeysUnused, rawMapKey.Interface())
+		delete(dataValKeysUnused, rawInputKey)
+		if trackingUnused {
+			d.unused.setPendingKey(rawInputKey)
+		}
 
 		// If the name is empty string, then we're at the root, and we
 		// don't dot-join the fields.
@@ -1720,6 +2152,18 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 
 		if err := d.decode(fieldName, rawMapVal.Interface(), fieldValue); err != nil {
 			errs = append(errs, err)
+			if trackingUnused && !unusedFrame.leftoverKeys[rawInputKey] {
+				// Unless a child container was only partially consumed, the
+				// failed value is treated as consumed.
+				d.unused.consumeKey(rawInputKey)
+			}
+			continue
+		}
+
+		if trackingUnused {
+			if !unusedFrame.leftoverKeys[rawInputKey] {
+				d.unused.consumeKey(rawInputKey)
+			}
 		}
 	}
 
@@ -1730,6 +2174,11 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 		remain := map[any]any{}
 		for key := range dataValKeysUnused {
 			remain[key] = dataVal.MapIndex(reflect.ValueOf(key)).Interface()
+		}
+
+		// Values taken by the remain field are fully consumed input.
+		if trackingUnused {
+			d.unused.consumeAll()
 		}
 
 		// Decode it as-if we were just decoding this map onto our map.
@@ -1745,7 +2194,7 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 	if d.config.ErrorUnused && len(dataValKeysUnused) > 0 {
 		keys := make([]string, 0, len(dataValKeysUnused))
 		for rawKey := range dataValKeysUnused {
-			keys = append(keys, rawKey.(string))
+			keys = append(keys, unusedKeyString(rawKey))
 		}
 		sort.Strings(keys)
 
@@ -1775,13 +2224,16 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 	}
 
 	if err := errors.Join(errs...); err != nil {
+		if trackingUnused {
+			d.unused.pop(unusedFrame)
+		}
 		return err
 	}
 
 	// Add the unused keys to the list of unused keys if we're tracking metadata
 	if d.config.Metadata != nil {
 		for rawKey := range dataValKeysUnused {
-			key := rawKey.(string)
+			key := unusedKeyString(rawKey)
 			if name != "" {
 				key = name + "." + key
 			}
@@ -1796,6 +2248,10 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 
 			d.config.Metadata.Unset = append(d.config.Metadata.Unset, key)
 		}
+	}
+
+	if trackingUnused {
+		d.unused.pop(unusedFrame)
 	}
 
 	return nil
