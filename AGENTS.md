@@ -27,6 +27,8 @@ The whole pool lives in two files: `workerpool.go` (mechanics) and `options.go` 
 
 A single dispatcher goroutine (`dispatch`), started by `New`, is the only goroutine that touches `waitingQueue` and the worker count. It creates workers lazily up to `maxWorkers`, and while the waiting queue is non-empty it routes all traffic through `processWaitingQueue` to preserve task order. When the pool is idle for a full idle timeout (default 2s, configurable or disabled via `WithIdleTimeout`), it reaps one idle worker per timeout period.
 
+`SetSize` resizes the pool at runtime: it stores the new limit in the atomic `maxWorkers` and wakes the dispatcher via the buffered `resizeSignal` (capacity 1, so signals coalesce and the latest size always wins). The dispatcher applies the new limit at the top of its loop: growth spawns workers to drain the existing `waitingQueue`, shrink retires idle workers immediately and busy workers at task boundaries (a ready excess worker receives `nil` instead of a task, both in the main select and in `processWaitingQueue`). `SetSize` rejects sizes < 1 with `ErrInvalidSize` and returns `ErrStopped` once the pool is stopped; it takes `stopLock` so it is ordered against `Pause` and `Stop`.
+
 Non-obvious invariants to preserve when changing this code:
 
 - Task submission must never block, no matter how many tasks are queued.

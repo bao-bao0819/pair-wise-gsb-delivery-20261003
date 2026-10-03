@@ -38,6 +38,15 @@ the dispatcher. This is done until there are no more workers to remove. The
 minimum number of workers is always zero, because the time to start new workers
 is insignificant.
 
+Resizing
+
+The maximum number of workers can be changed at any time by calling SetSize.
+Growing the pool immediately starts new workers to execute tasks that are
+already waiting in the queue. Shrinking the pool retires workers at task
+boundaries, as each worker becomes ready for new work, so running tasks are
+never interrupted. If the size is changed again before a previous shrink has
+finished, the most recent size takes effect.
+
 Usage note
 
 It is advisable to use different worker pools for tasks that are bound by

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -45,7 +46,7 @@ func TestMaxWorkers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		wp := New(0)
 		wp.Stop()
-		if wp.maxWorkers != 1 {
+		if wp.Size() != 1 {
 			t.Fatal("should have created one worker")
 		}
 
@@ -84,6 +85,320 @@ func TestMaxWorkers(t *testing.T) {
 		// Release workers.
 		close(release)
 	})
+}
+
+func TestSetSizeInvalid(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(3)
+		defer wp.Stop()
+
+		for _, size := range []int{0, -1} {
+			if err := wp.SetSize(size); !errors.Is(err, ErrInvalidSize) {
+				t.Fatal("SetSize(", size, "): expected ErrInvalidSize, got", err)
+			}
+		}
+		if wp.Size() != 3 {
+			t.Fatal("pool size changed after invalid SetSize")
+		}
+	})
+}
+
+func TestSetSizeStopped(t *testing.T) {
+	wp := New(2)
+	wp.Stop()
+	if err := wp.SetSize(4); !errors.Is(err, ErrStopped) {
+		t.Fatal("expected ErrStopped, got", err)
+	}
+
+	wp = New(2)
+	wp.StopWait()
+	if err := wp.SetSize(4); !errors.Is(err, ErrStopped) {
+		t.Fatal("expected ErrStopped, got", err)
+	}
+}
+
+func TestSetSizeGrow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(2, WithIdleTimeout(-1))
+		defer wp.Stop()
+
+		release := make(chan struct{})
+		started := make(chan struct{}, 12)
+		for range 12 {
+			wp.Submit(func() {
+				started <- struct{}{}
+				<-release
+			})
+		}
+		synctest.Wait()
+		if n := len(started); n != 2 {
+			t.Fatal("expected 2 running tasks, have", n)
+		}
+		if wp.WaitingQueueSize() != 10 {
+			t.Fatal("expected 10 waiting tasks, have", wp.WaitingQueueSize())
+		}
+
+		// Growing the pool must wake tasks already waiting in the queue,
+		// without any new tasks being submitted.
+		if err := wp.SetSize(8); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if n := len(started); n != 8 {
+			t.Fatal("expected 8 running tasks after grow, have", n)
+		}
+		if wp.Size() != 8 {
+			t.Fatal("wrong size returned")
+		}
+		close(release)
+	})
+}
+
+func TestSetSizeShrink(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(5, WithIdleTimeout(-1))
+		defer wp.Stop()
+
+		var active, peak atomic.Int32
+		recordStart := func() {
+			n := active.Add(1)
+			for {
+				old := peak.Load()
+				if n <= old || peak.CompareAndSwap(old, n) {
+					break
+				}
+			}
+		}
+
+		release1 := make(chan struct{})
+		started1 := make(chan struct{}, 5)
+		for range 5 {
+			wp.Submit(func() {
+				recordStart()
+				started1 <- struct{}{}
+				<-release1
+				active.Add(-1)
+			})
+		}
+		for range 5 {
+			select {
+			case <-started1:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for tasks to start")
+			}
+		}
+
+		// Shrink while all workers are busy. Running tasks must not be
+		// interrupted.
+		if err := wp.SetSize(2); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if n := active.Load(); n != 5 {
+			t.Fatal("running tasks were interrupted by shrink, active:", n)
+		}
+
+		// Let the running tasks finish; excess workers retire at task
+		// boundaries.
+		close(release1)
+		synctest.Wait()
+		if n := countReady(wp); n != 2 {
+			t.Fatal("expected 2 workers after shrink, have", n)
+		}
+
+		// The peak number of active tasks now stays within the new limit.
+		peak.Store(0)
+		release2 := make(chan struct{})
+		started2 := make(chan struct{}, 10)
+		var done sync.WaitGroup
+		done.Add(10)
+		for range 10 {
+			wp.Submit(func() {
+				recordStart()
+				started2 <- struct{}{}
+				<-release2
+				active.Add(-1)
+				done.Done()
+			})
+		}
+		synctest.Wait()
+		if n := len(started2); n != 2 {
+			t.Fatal("expected 2 running tasks after shrink, have", n)
+		}
+		close(release2)
+		done.Wait()
+		if n := peak.Load(); n != 2 {
+			t.Fatal("peak active tasks did not drop to new limit, peak:", n)
+		}
+	})
+}
+
+func TestSetSizeShrinkThenGrow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(6, WithIdleTimeout(-1))
+		defer wp.Stop()
+
+		release := make(chan struct{})
+		started := make(chan struct{}, 6)
+		for range 6 {
+			wp.Submit(func() {
+				started <- struct{}{}
+				<-release
+			})
+		}
+		for range 6 {
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for tasks to start")
+			}
+		}
+
+		// Shrink, then grow again before the shrink has completed. The most
+		// recent size is the one that takes effect.
+		if err := wp.SetSize(1); err != nil {
+			t.Fatal(err)
+		}
+		if err := wp.SetSize(4); err != nil {
+			t.Fatal(err)
+		}
+		close(release)
+		synctest.Wait()
+		if n := countReady(wp); n != 4 {
+			t.Fatal("expected 4 workers after shrink then grow, have", n)
+		}
+	})
+}
+
+func TestSetSizeWhilePaused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4, WithIdleTimeout(-1))
+		defer wp.Stop()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		wp.Pause(ctx)
+
+		// Resizing a paused pool must not block or deadlock.
+		if err := wp.SetSize(2); err != nil {
+			t.Fatal(err)
+		}
+		if wp.Size() != 2 {
+			t.Fatal("wrong size returned")
+		}
+
+		// Paused workers are retired at a task boundary once unpaused.
+		cancel()
+		synctest.Wait()
+		if n := countReady(wp); n != 2 {
+			t.Fatal("expected 2 workers after unpausing shrunk pool, have", n)
+		}
+	})
+}
+
+func TestSetSizeStopWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4, WithIdleTimeout(-1))
+
+		release := make(chan struct{})
+		var executed atomic.Int32
+		started := make(chan struct{}, 4)
+		for range 4 {
+			wp.Submit(func() {
+				started <- struct{}{}
+				<-release
+				executed.Add(1)
+			})
+		}
+		for range 4 {
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for tasks to start")
+			}
+		}
+
+		// Queue tasks behind the running ones, then shrink.
+		for range 8 {
+			wp.Submit(func() {
+				executed.Add(1)
+			})
+		}
+		if err := wp.SetSize(1); err != nil {
+			t.Fatal(err)
+		}
+
+		// StopWait still drains every queued task.
+		close(release)
+		wp.StopWait()
+		if n := executed.Load(); n != 12 {
+			t.Fatal("StopWait did not drain all tasks, executed:", n)
+		}
+	})
+}
+
+// Run this test with the race detector. Concurrent resizing must not lose
+// tasks or start a task more than once, and the number of concurrently
+// active tasks must never exceed the largest size ever set.
+func TestSetSizeConcurrent(t *testing.T) {
+	wp := New(4, WithIdleTimeout(-1))
+
+	const (
+		resizerCount = 3
+		taskCount    = 300
+		largestSize  = 16
+	)
+
+	var runs [taskCount]atomic.Int32
+	var active, peak atomic.Int32
+
+	stopResize := make(chan struct{})
+	var resizeWG sync.WaitGroup
+	for range resizerCount {
+		resizeWG.Add(1)
+		go func() {
+			defer resizeWG.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stopResize:
+					return
+				default:
+				}
+				if err := wp.SetSize(1 + i%largestSize); err != nil {
+					t.Error("SetSize:", err)
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+
+	for i := range taskCount {
+		wp.Submit(func() {
+			runs[i].Add(1)
+			n := active.Add(1)
+			for {
+				old := peak.Load()
+				if n <= old || peak.CompareAndSwap(old, n) {
+					break
+				}
+			}
+			time.Sleep(time.Millisecond)
+			active.Add(-1)
+		})
+	}
+
+	close(stopResize)
+	resizeWG.Wait()
+	wp.StopWait()
+
+	for i := range runs {
+		if n := runs[i].Load(); n != 1 {
+			t.Fatalf("task %d ran %d times", i, n)
+		}
+	}
+	if n := peak.Load(); n > largestSize {
+		t.Fatal("active tasks exceeded largest size ever set:", n)
+	}
 }
 
 func TestReuseWorkers(t *testing.T) {
