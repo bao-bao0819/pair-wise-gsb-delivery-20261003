@@ -211,6 +211,36 @@ opt := secure.Options{
 }
 ~~~
 
+### Permissions Policy
+You can utilize the Permissions Policy Builder to create typed policies. A feature can allow all origins, deny all origins, allow only the current origin, or allow an explicit list of origins:
+
+~~~ go
+import (
+	"github.com/unrolled/secure"
+	"github.com/unrolled/secure/permissionspolicybuilder"
+)
+
+permissionsPolicyBuilder := permissionspolicybuilder.Builder{
+	Features: map[string]permissionspolicybuilder.FeatureRule{
+		"camera": {
+			Type: permissionspolicybuilder.AllowOrigins,
+			Origins: []string{"https://example.com", "https://foo.com"},
+		},
+		"geolocation": {Type: permissionspolicybuilder.AllowSelf},
+		"microphone":  {Type: permissionspolicybuilder.AllowNone},
+		"fullscreen":  {Type: permissionspolicybuilder.AllowAll},
+	},
+}
+
+opt := secure.Options{
+	PermissionsPolicyBuilder: &permissionsPolicyBuilder,
+}
+~~~
+
+This produces `camera=("https://example.com" "https://foo.com"), fullscreen=*, geolocation=(self), microphone=()`. Feature directives are sorted for stable output, origins are quoted individually, and the directives are comma separated rather than using CSP's `; ` separator. An empty origin list denies all origins (`camera=()`).
+
+You may also use the raw `PermissionsPolicy` string option, but setting both `PermissionsPolicy` and `PermissionsPolicyBuilder` panics with a configuration conflict.
+
 ## Integration examples
 
 ### [chi](https://github.com/pressly/chi)

@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/unrolled/secure/permissionspolicybuilder"
 )
 
 type secureCtxKey string
@@ -91,6 +93,9 @@ type Options struct {
 	FeaturePolicy string
 	// PermissionsPolicy allows to selectively enable and disable use of various browser features and APIs. Default is "".
 	PermissionsPolicy string
+	// PermissionsPolicyBuilder allows to selectively enable and disable use of various browser features and APIs
+	// using a typed builder. It may not be set at the same time as PermissionsPolicy. Default is nil.
+	PermissionsPolicyBuilder *permissionspolicybuilder.Builder
 	// CrossOriginOpenerPolicy allows you to ensure a top-level document does not share a browsing context group with cross-origin documents. Default is "".
 	// Reference: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cross-Origin-Opener-Policy
 	CrossOriginOpenerPolicy string
@@ -145,6 +150,9 @@ type Secure struct {
 
 	// ctxSecureHeaderKey is the key used for context storage for request modification.
 	ctxSecureHeaderKey secureCtxKey
+
+	// permissionsPolicy is the resolved Permissions-Policy header value.
+	permissionsPolicy string
 }
 
 // New constructs a new Secure instance with the supplied options.
@@ -165,6 +173,16 @@ func New(options ...Options) *Secure {
 		opt:               o,
 		badHostHandler:    http.HandlerFunc(defaultBadHostHandler),
 		badRequestHandler: http.HandlerFunc(defaultBadRequestHandler),
+	}
+
+	if len(o.PermissionsPolicy) > 0 && o.PermissionsPolicyBuilder != nil {
+		panic("PermissionsPolicy and PermissionsPolicyBuilder options cannot both be set")
+	}
+
+	if o.PermissionsPolicyBuilder != nil {
+		s.permissionsPolicy = o.PermissionsPolicyBuilder.MustBuild()
+	} else {
+		s.permissionsPolicy = o.PermissionsPolicy
 	}
 
 	if s.opt.AllowedHostsAreRegex {
@@ -472,8 +490,8 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 	}
 
 	// Permissions Policy header.
-	if len(s.opt.PermissionsPolicy) > 0 {
-		responseHeader.Set(permissionsPolicyHeader, s.opt.PermissionsPolicy)
+	if len(s.permissionsPolicy) > 0 {
+		responseHeader.Set(permissionsPolicyHeader, s.permissionsPolicy)
 	}
 
 	// Cross Origin Opener Policy header.

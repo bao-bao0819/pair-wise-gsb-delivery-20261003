@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/unrolled/secure/permissionspolicybuilder"
 )
 
 const (
@@ -1043,6 +1045,142 @@ func TestPermissionsPolicy(t *testing.T) {
 
 	expect(t, res.Code, http.StatusOK)
 	expect(t, res.Header().Get("Permissions-Policy"), "geolocation=(self)")
+}
+
+func TestPermissionsPolicyBuilder(t *testing.T) {
+	s := New(Options{
+		PermissionsPolicyBuilder: &permissionspolicybuilder.Builder{
+			Features: map[string]permissionspolicybuilder.FeatureRule{
+				"geolocation": {Type: permissionspolicybuilder.AllowSelf},
+			},
+		},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+	expect(t, res.Header().Get("Permissions-Policy"), "geolocation=(self)")
+}
+
+func TestPermissionsPolicyBuilderEmptyList(t *testing.T) {
+	s := New(Options{
+		PermissionsPolicyBuilder: &permissionspolicybuilder.Builder{
+			Features: map[string]permissionspolicybuilder.FeatureRule{
+				"camera": {
+					Type:    permissionspolicybuilder.AllowOrigins,
+					Origins: []string{},
+				},
+			},
+		},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+	expect(t, res.Header().Get("Permissions-Policy"), "camera=()")
+}
+
+func TestPermissionsPolicyBuilderMultipleOrigins(t *testing.T) {
+	s := New(Options{
+		PermissionsPolicyBuilder: &permissionspolicybuilder.Builder{
+			Features: map[string]permissionspolicybuilder.FeatureRule{
+				"camera": {
+					Type: permissionspolicybuilder.AllowOrigins,
+					Origins: []string{
+						"https://a.example.com",
+						"https://b.example.com",
+					},
+				},
+				"geolocation": {Type: permissionspolicybuilder.AllowAll},
+			},
+		},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+	expect(
+		t,
+		res.Header().Get("Permissions-Policy"),
+		`camera=("https://a.example.com" "https://b.example.com"), geolocation=*`,
+	)
+}
+
+func TestPermissionsPolicyBuilderNestedMiddleware(t *testing.T) {
+	inner := New(Options{
+		PermissionsPolicyBuilder: &permissionspolicybuilder.Builder{
+			Features: map[string]permissionspolicybuilder.FeatureRule{
+				"camera": {Type: permissionspolicybuilder.AllowNone},
+			},
+		},
+	})
+
+	outer := New(Options{
+		PermissionsPolicyBuilder: &permissionspolicybuilder.Builder{
+			Features: map[string]permissionspolicybuilder.FeatureRule{
+				"geolocation": {Type: permissionspolicybuilder.AllowSelf},
+			},
+		},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+
+	handler := outer.Handler(inner.Handler(myHandler))
+	handler.ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+	// Set replaces the outer value, so the two policies are never concatenated
+	// into a single header or emitted as duplicate header lines.
+	got := res.Header()["Permissions-Policy"]
+	if !reflect.DeepEqual(got, []string{"camera=()"}) {
+		t.Errorf("Expected single Permissions-Policy header [camera=()], got %v", got)
+	}
+}
+
+func TestPermissionsPolicyBuilderConflictWithString(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("The code did not panic")
+		}
+	}()
+
+	New(Options{
+		PermissionsPolicy: "geolocation=(self)",
+		PermissionsPolicyBuilder: &permissionspolicybuilder.Builder{
+			Features: map[string]permissionspolicybuilder.FeatureRule{
+				"camera": {Type: permissionspolicybuilder.AllowNone},
+			},
+		},
+	})
+}
+
+func TestPermissionsPolicyBuilderInvalidPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("The code did not panic")
+		}
+	}()
+
+	New(Options{
+		PermissionsPolicyBuilder: &permissionspolicybuilder.Builder{
+			Features: map[string]permissionspolicybuilder.FeatureRule{
+				"camera": {
+					Type:    permissionspolicybuilder.AllowOrigins,
+					Origins: []string{"*"},
+				},
+			},
+		},
+	})
 }
 
 func TestCrossOriginOpenerPolicy(t *testing.T) {
