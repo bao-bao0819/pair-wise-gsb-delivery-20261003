@@ -227,3 +227,44 @@ type SMSProviderConfig struct {
 
 Also, envconfig will use a `Set(string) error` method like from the
 [flag.Value](https://godoc.org/flag#Value) interface if implemented.
+
+## Validation
+
+A struct (or any converted value) that implements `envconfig.Validator` is
+checked after all of its fields have been converted, including defaults and
+custom decoder results:
+
+```Go
+type Validator interface {
+    Validate() error
+}
+```
+
+Nested structs are validated from the inside out: a struct's `Validate` runs
+only after every nested struct within it has been converted and validated.
+This lets a validator enforce cross-field conditions such as a port range
+depending on the listen mode, or TLS certificate and key paths appearing as a
+pair:
+
+```Go
+type ListenerConfig struct {
+    Mode     string
+    Port     int
+    CertFile string
+    KeyFile  string
+}
+
+func (c *ListenerConfig) Validate() error {
+    if (c.CertFile == "") != (c.KeyFile == "") {
+        return errors.New("cert and key paths must be set together")
+    }
+    return nil
+}
+```
+
+If conversion fails inside a nested subtree, validation of every ancestor
+that depends on that subtree is skipped; errors from independent sibling
+subtrees are still returned together. Validation errors are wrapped in
+`envconfig.ValidationError`, which carries the full dotted struct path. Each
+concrete instance is validated at most once, even when the same pointer is
+reachable through multiple fields.
