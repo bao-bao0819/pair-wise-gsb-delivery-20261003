@@ -2548,6 +2548,52 @@ func TestGroup(t *testing.T) {
 	assert(t, res == `["123"]`)
 }
 
+func TestBucket(t *testing.T) {
+	// Distinct types land in distinct buckets ("1" vs 1, missing vs null),
+	// duplicate combinations merge, and both bucket and member order are
+	// stable. Members are emitted as their original raw json.
+	json := `[
+		{"id":1,"name":"ann"},
+		{"id":"1","name":"bob"},
+		{"id":1,"name":"cat"},
+		{"id":null,"name":"dan"},
+		{"name":"eve"}
+	]`
+	res := Get(json, "@bucket:id").Raw
+	assert(t, res == `[{"keys":[1],"members":[{"id":1,"name":"ann"},{"id":1,"name":"cat"}]},`+
+		`{"keys":["1"],"members":[{"id":"1","name":"bob"}]},`+
+		`{"keys":[null],"members":[{"id":null,"name":"dan"}]},`+
+		`{"keys":[null],"members":[{"name":"eve"}]}]`)
+
+	// Multiple key paths, including nested paths, form a composite key.
+	json = `[
+		{"user":{"id":1},"ok":true},
+		{"user":{"id":1},"ok":true},
+		{"user":{"id":2},"ok":true},
+		{"user":{"id":1},"ok":false}
+	]`
+	res = Get(json, "@bucket:user.id,ok").Raw
+	assert(t, res == `[{"keys":[1,true],"members":[{"user":{"id":1},"ok":true},{"user":{"id":1},"ok":true}]},`+
+		`{"keys":[2,true],"members":[{"user":{"id":2},"ok":true}]},`+
+		`{"keys":[1,false],"members":[{"user":{"id":1},"ok":false}]}]`)
+
+	// Composite keys containing separators must not collide.
+	json = `[{"a":"x","b":"y,z"},{"a":"x,y","b":"z"}]`
+	res = Get(json, "@bucket:a,b").Raw
+	assert(t, res == `[{"keys":["x","y,z"],"members":[{"a":"x","b":"y,z"}]},`+
+		`{"keys":["x,y","z"],"members":[{"a":"x,y","b":"z"}]}]`)
+
+	// Escaped strings are preserved raw, without a decode/encode roundtrip.
+	json = `[{"name":"a\"b"},{"name":"a\"b"},{"name":"a\\b"}]`
+	res = Get(json, "@bucket:name").Raw
+	assert(t, res == `[{"keys":["a\"b"],"members":[{"name":"a\"b"},{"name":"a\"b"}]},`+
+		`{"keys":["a\\b"],"members":[{"name":"a\\b"}]}]`)
+
+	// Empty arrays and non-arrays.
+	assert(t, Get(`[]`, "@bucket:id").Raw == `[]`)
+	assert(t, Get(`{"id":1}`, "@bucket:id").Raw == ``)
+}
+
 func goJSONMarshal(i interface{}) ([]byte, error) {
 	buffer := &bytes.Buffer{}
 	encoder := json.NewEncoder(buffer)

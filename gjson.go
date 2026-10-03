@@ -2976,6 +2976,7 @@ func init() {
 		"tostr":   modToStr,
 		"fromstr": modFromStr,
 		"group":   modGroup,
+		"bucket":  modBucket,
 		"dig":     modDig,
 	}
 }
@@ -3325,6 +3326,98 @@ func modGroup(json, arg string) string {
 	}
 	data = append(data, ']')
 	return string(data)
+}
+
+// @bucket groups the elements of an array into buckets based on the values
+// of one or more key paths.
+//
+// The arg is a comma-separated list of key paths, such as
+// "@bucket:kind,meta.level". Each distinct combination of key values forms
+// a bucket. The result is an array of objects, one per bucket, ordered by
+// when each combination was first encountered:
+//
+//	[{"keys":[...],"members":[...]}, ...]
+//
+// The "keys" array holds the key value tuple for the bucket and "members"
+// holds the original array elements, unmodified and in their original
+// order. Values are compared by their raw json, so the string "1" and the
+// number 1 land in different buckets, as do a missing key and a null value.
+// A missing key is represented as null in the "keys" array.
+//
+//	[{"id":1},{"id":"1"},{"id":1}] -> @bucket:id ->
+//	[{"keys":[1],"members":[{"id":1},{"id":1}]},
+//	 {"keys":["1"],"members":[{"id":"1"}]}]
+//
+// An empty string is returned when the json is not an array.
+func modBucket(json, arg string) string {
+	res := Parse(json)
+	if !res.IsArray() {
+		return ""
+	}
+	var paths []string
+	if arg != "" {
+		paths = strings.Split(arg, ",")
+	}
+	type bucket struct {
+		keys    []string
+		members []string
+	}
+	var buckets []*bucket
+	indexes := make(map[string]*bucket)
+	res.ForEach(func(_, value Result) bool {
+		keys := make([]string, len(paths))
+		var id []byte
+		for i, path := range paths {
+			v := value.Get(path)
+			if v.Exists() {
+				// Prefix the raw value with its length so that
+				// composite keys containing separators cannot
+				// collide, and so that distinct types such as the
+				// string "1" and the number 1 never share a bucket.
+				id = append(id, '1')
+				id = strconv.AppendInt(id, int64(len(v.Raw)), 10)
+				id = append(id, ':')
+				id = append(id, v.Raw...)
+				keys[i] = v.Raw
+			} else {
+				id = append(id, '0')
+				keys[i] = "null"
+			}
+			id = append(id, ';')
+		}
+		b, ok := indexes[string(id)]
+		if !ok {
+			b = &bucket{keys: keys}
+			indexes[string(id)] = b
+			buckets = append(buckets, b)
+		}
+		b.members = append(b.members, value.Raw)
+		return true
+	})
+	var out []byte
+	out = append(out, '[')
+	for i, b := range buckets {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, `{"keys":[`...)
+		for j, key := range b.keys {
+			if j > 0 {
+				out = append(out, ',')
+			}
+			out = append(out, key...)
+		}
+		out = append(out, `],"members":[`...)
+		for j, member := range b.members {
+			if j > 0 {
+				out = append(out, ',')
+			}
+			out = append(out, member...)
+		}
+		out = append(out, `]}`...)
+	}
+	out = append(out, ']')
+	return string(out)
 }
 
 // stringHeader instead of reflect.StringHeader
