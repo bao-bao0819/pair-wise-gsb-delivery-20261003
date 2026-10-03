@@ -25,6 +25,7 @@ type Sketch struct {
 	p          uint8
 	m          uint32
 	alpha      float64
+	generation uint64
 	tmpSet     set
 	sparseList *compressedList
 	regs       []uint8
@@ -80,9 +81,10 @@ func NewSketch(precision uint8, sparse bool) (*Sketch, error) {
 	}
 	m := uint32(1) << precision
 	s := &Sketch{
-		m:     m,
-		p:     precision,
-		alpha: alpha(float64(m)),
+		m:          m,
+		p:          precision,
+		alpha:      alpha(float64(m)),
+		generation: 1,
 	}
 	if sparse {
 		s.tmpSet = makeSet(0)
@@ -564,8 +566,14 @@ func (sk *Sketch) unmarshalBinaryV2(data []byte) error {
 }
 
 // Reset clears the sketch while preserving its current representation and
-// allocated backing storage.
+// allocated backing storage, and enters a new generation: every successful
+// Reset increments the generation reported by Generation, so deltas exported
+// before the Reset are rejected by ApplyDelta afterwards and cannot revive
+// the cleared registers. The zero-value Sketch is left untouched.
 func (sk *Sketch) Reset() {
+	if sk.p != 0 {
+		sk.generation++
+	}
 	if sk.sparse() {
 		sk.tmpSet.clear()
 		sk.sparseList.clear()

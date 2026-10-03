@@ -37,6 +37,33 @@ This implementation allows for creating HyperLogLog sketches with arbitrary prec
 
 Users can choose the precision that best fits their use case, balancing memory usage against estimation accuracy.
 
+## Incremental delta exchange
+
+Dense sketches can exchange increments instead of merging whole sketches.
+`DeltaSince` exports the registers that were raised relative to a baseline
+snapshot, and `ApplyDelta` raises them on another compatible dense sketch:
+
+```go
+baseline := a.Clone()            // snapshot shared at the previous exchange
+// ... a.Insert(...) on one node ...
+delta, err := a.DeltaSince(baseline)
+if err != nil {
+    // only initialized, dense sketches of the same precision are compatible
+}
+if err := b.ApplyDelta(delta); err != nil {
+    // precision or generation mismatch, or an invalid entry
+}
+```
+
+Each `Delta` carries the precision, the sketch's generation, and the changed
+register indices with their absolute rho values. Application is an
+element-wise maximum, so a delta applied twice or a set of deltas applied in
+any order converges to the same result. `Reset` enters a new generation, so
+deltas produced before the reset are rejected and cannot revive the cleared
+registers. Sparse sketches are not part of this exchange: they are rejected
+until converted explicitly with `ToDense`, keeping dense register values from
+ever being mixed with the internal sparse encoding.
+
 ## Note
 A big thank you to Prof. Shigang Chen and his team at the University of Florida who are actively conducting research around "Big Network Data".
 
