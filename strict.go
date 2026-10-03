@@ -8,6 +8,14 @@ import (
 type strict struct {
 	Enabled bool
 
+	// exempt lists structured key paths that are allowed to be absent from
+	// the target. An entry exempts the key it names together with every key
+	// below it, so it covers a whole subtree and all elements of an array
+	// table. Matching is done segment by segment: the path
+	// ["plugins", "extra"] matches "plugins.extra", but not a single key
+	// literally named "plugins.extra".
+	exemptPaths []Key
+
 	// Tracks the current key being processed.
 	key tracker.KeyTracker
 
@@ -44,6 +52,9 @@ func (s *strict) MissingTable(node *unstable.Node) {
 	if !s.Enabled {
 		return
 	}
+	if s.isExempt(s.key.Key()) {
+		return
+	}
 	s.missing = append(s.missing, decodeError{
 		highlight: keyLocation(node),
 		key:       s.key.Key(),
@@ -58,12 +69,41 @@ func (s *strict) MissingField(node *unstable.Node) {
 		return
 	}
 	s.key.Push(node)
+	key := s.key.Key()
+	if s.isExempt(key) {
+		s.key.Pop(node)
+		return
+	}
 	s.missing = append(s.missing, decodeError{
 		highlight: keyLocation(node),
-		key:       s.key.Key(),
+		key:       key,
 		message:   "unknown field",
 	})
 	s.key.Pop(node)
+}
+
+// isExempt reports whether key is covered by one of the exemption rules. A
+// rule matches when every one of its segments equals the leading segments
+// of key, so a rule matches the key it names and all of its descendants.
+// An empty rule never matches: strict mode must keep reporting truly
+// unknown keys rather than blanket-ignoring the document.
+func (s *strict) isExempt(key Key) bool {
+	for _, rule := range s.exemptPaths {
+		if len(rule) == 0 || len(rule) > len(key) {
+			continue
+		}
+		matches := true
+		for i, segment := range rule {
+			if key[i] != segment {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
 }
 
 // Error returns the cumulated StrictMissingError for the document, or nil.

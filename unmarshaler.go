@@ -83,6 +83,9 @@ type Decoder struct {
 	// global settings
 	strict bool
 
+	// paths exempt from strict mode, as decoded key segments
+	unknownFieldsAllowed []Key
+
 	// toggles unmarshaler interface
 	unmarshalerInterface bool
 }
@@ -101,6 +104,27 @@ func NewDecoder(r io.Reader) *Decoder {
 // description of the missing fields.
 func (d *Decoder) DisallowUnknownFields() *Decoder {
 	d.strict = true
+	return d
+}
+
+// AllowUnknownFields exempts the given key paths from strict mode. It only
+// has an effect when DisallowUnknownFields is also enabled.
+//
+// Each path is a sequence of decoded key segments, not a dotted string:
+// AllowUnknownFields(toml.Key{"plugins", "extra"}) matches the subtree
+// reached through the "plugins" table and its "extra" child, whereas
+// toml.Key{"plugins.extra"} matches a single, quoted key literally named
+// "plugins.extra".
+//
+// A path exempts the key it names together with every key below it, so it
+// covers a whole subtree and all elements of an array table:
+// AllowUnknownFields(toml.Key{"plugins"}) allows unknown content under
+// [plugins], [plugins.extra], as well as every element of [[plugins]].
+// Unknown keys outside of the exempt paths are still reported together in
+// the StrictMissingError. Exemptions never make malformed documents or
+// duplicate declarations valid.
+func (d *Decoder) AllowUnknownFields(paths ...Key) *Decoder {
+	d.unknownFieldsAllowed = append(d.unknownFieldsAllowed[:0], paths...)
 	return d
 }
 
@@ -175,6 +199,7 @@ func (d *Decoder) Decode(v interface{}) error {
 	}
 
 	dec := getDecoder(d.strict, d.unmarshalerInterface)
+	dec.strict.exemptPaths = append(dec.strict.exemptPaths[:0], d.unknownFieldsAllowed...)
 	err = dec.unmarshal(b, v)
 	putDecoder(dec)
 	return err

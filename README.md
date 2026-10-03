@@ -44,6 +44,22 @@ operations should not be shockingly slow. See [benchmarks](#benchmarks).
 the TOML document was not present in the target structure. This is a great way
 to check for typos. [See example in the documentation][strict].
 
+Subtrees managed by external components can be carved out of strict mode with
+`Decoder.AllowUnknownFields`. Paths are sequences of decoded key segments (a
+`toml.Key`), so a rule matches a subtree and every element of an array table,
+and `toml.Key{"plugins", "extra"}` is not the same as a single quoted key
+literally named `plugins.extra`:
+
+```go
+err := toml.NewDecoder(r).
+    DisallowUnknownFields().
+    AllowUnknownFields(toml.Key{"plugins", "extra"}).
+    Decode(&config)
+```
+
+Unknown fields outside of the allowed paths are still reported together;
+exemptions never make malformed documents or duplicate declarations valid.
+
 [strict]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#example-Decoder.DisallowUnknownFields
 
 ### Contextualized errors
