@@ -38,6 +38,14 @@ the dispatcher. This is done until there are no more workers to remove. The
 minimum number of workers is always zero, because the time to start new workers
 is insignificant.
 
+Task panics
+
+A task that panics propagates the panic out of its worker goroutine, crashing
+the program, unless a panic handler is configured with [WithPanicHandler].
+With a handler set, the worker recovers the panic, reports the panic value
+and stack to the handler, counts the task as finished, and continues with the
+next task.
+
 Usage note
 
 It is advisable to use different worker pools for tasks that are bound by

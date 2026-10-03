@@ -3,7 +3,9 @@ package workerpool
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -718,6 +720,122 @@ func countReady(w *WorkerPool) int {
 Run benchmarking with: go test -bench '.'
 
 */
+func TestPanicHandlerSingleWorker(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var panics []any
+		wp := New(1, WithPanicHandler(func(panicValue any, stack []byte) {
+			panics = append(panics, panicValue)
+			if len(stack) == 0 {
+				t.Error("panic handler received empty stack")
+			}
+			if !strings.Contains(string(stack), "workerpool") {
+				t.Error("panic handler stack does not contain original stack")
+			}
+		}))
+
+		var ran atomic.Int32
+		for i := range 5 {
+			wp.Submit(func() {
+				ran.Add(1)
+				panic(i)
+			})
+		}
+		// The worker must continue with tasks submitted after panics.
+		wp.Submit(func() { ran.Add(1) })
+
+		wp.StopWait()
+
+		if ran.Load() != 6 {
+			t.Fatal("worker did not continue after panicking tasks, ran:", ran.Load())
+		}
+		if len(panics) != 5 {
+			t.Fatal("panic handler not called for each panicking task, got:", len(panics))
+		}
+		for i, p := range panics {
+			if p != i {
+				t.Fatal("panic handler received wrong value:", p, "expected:", i)
+			}
+		}
+	})
+}
+
+func TestPanicHandlerMultipleWorkers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var panicCount atomic.Int32
+		wp := New(max, WithPanicHandler(func(any, []byte) {
+			panicCount.Add(1)
+		}))
+
+		const numTasks = max * 3
+		started := make(chan struct{}, numTasks)
+		release := make(chan struct{})
+		for range numTasks {
+			wp.Submit(func() {
+				started <- struct{}{}
+				<-release
+				panic("boom")
+			})
+		}
+		// Wait for all workers to be running tasks concurrently.
+		for range max {
+			<-started
+		}
+		close(release)
+
+		wp.StopWait()
+
+		if panicCount.Load() != numTasks {
+			t.Fatal("panic handler call count mismatch, got:", panicCount.Load(), "expected:", numTasks)
+		}
+	})
+}
+
+func TestPanicHandlerDuringStopWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var panicCount atomic.Int32
+		wp := New(2, WithPanicHandler(func(any, []byte) {
+			panicCount.Add(1)
+		}))
+
+		// Occupy both workers, then queue panicking tasks behind them so that
+		// the panics happen while StopWait drains the waiting queue.
+		release := make(chan struct{})
+		for range 2 {
+			wp.Submit(func() { <-release })
+		}
+		const numPanics = 10
+		for range numPanics {
+			wp.Submit(func() { panic("boom") })
+		}
+		close(release)
+
+		// StopWait must drain the queued panicking tasks and not hang.
+		wp.StopWait()
+
+		if panicCount.Load() != numPanics {
+			t.Fatal("panic handler call count mismatch, got:", panicCount.Load(), "expected:", numPanics)
+		}
+	})
+}
+
+func TestPanicHandlerQueriesPoolState(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var wp *WorkerPool
+		handlerDone := make(chan struct{})
+		wp = New(2, WithPanicHandler(func(any, []byte) {
+			// The handler must be able to query pool state without
+			// deadlocking on internal locks.
+			_ = wp.Size()
+			_ = wp.WaitingQueueSize()
+			_ = wp.Stopped()
+			close(handlerDone)
+		}))
+
+		wp.Submit(func() { panic("boom") })
+		<-handlerDone
+		wp.StopWait()
+	})
+}
 
 func BenchmarkEnqueue(b *testing.B) {
 	wp := New(1)

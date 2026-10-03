@@ -3,6 +3,7 @@ package workerpool
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,7 +40,7 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 	}
 
 	// Start the task dispatcher.
-	go pool.dispatch(cfg.idleTimeout)
+	go pool.dispatch(cfg.idleTimeout, cfg.panicHandler)
 
 	return pool
 }
@@ -184,7 +185,7 @@ func (p *WorkerPool) Pause(ctx context.Context) {
 }
 
 // dispatch sends the next queued task to an available worker.
-func (p *WorkerPool) dispatch(idleTimeout time.Duration) {
+func (p *WorkerPool) dispatch(idleTimeout time.Duration, panicHandler PanicHandler) {
 	defer close(p.stoppedChan)
 	var idle bool
 	var idleTO <-chan time.Time
@@ -223,7 +224,7 @@ Loop:
 				// Create a new worker, if not at max.
 				if workerCount < p.maxWorkers {
 					wg.Add(1)
-					go worker(task, p.workerQueue, &wg)
+					go worker(task, p.workerQueue, &wg, panicHandler)
 					workerCount++
 				} else {
 					// Enqueue task to be executed by next available worker.
@@ -259,12 +260,33 @@ Loop:
 }
 
 // worker executes tasks and stops when it receives a nil task.
-func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
+//
+// Done is deferred so that the worker count is always released, even if the
+// panic handler itself panics and the panic propagates out of the worker.
+func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup, panicHandler PanicHandler) {
+	defer wg.Done()
 	for task != nil {
-		task()
+		runTask(task, panicHandler)
 		task = <-workerQueue
 	}
-	wg.Done()
+}
+
+// runTask runs a single task, recovering a task panic and reporting it to
+// the panic handler when one is configured. The handler is called
+// synchronously, in the worker goroutine, while the worker holds no pool
+// locks. A panic raised by the handler itself is not recovered and
+// propagates out of the worker.
+func runTask(task func(), panicHandler PanicHandler) {
+	if panicHandler == nil {
+		task()
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			panicHandler(r, debug.Stack())
+		}
+	}()
+	task()
 }
 
 // stop tells the dispatcher to exit, and whether or not to complete queued

@@ -47,6 +47,18 @@ func main() {
 
 [Example wrapper function](https://go.dev/play/p/BWnRhJYarZ1) to show start and finish time of submitted function.
 
+## Task panics
+
+By default, a task that panics crashes the program, since the panic propagates out of the worker goroutine. For batch processing that must continue with subsequent tasks, configure a panic handler with `WithPanicHandler`:
+
+```go
+wp := workerpool.New(4, workerpool.WithPanicHandler(func(panicValue any, stack []byte) {
+	log.Printf("task panicked: %v\n%s", panicValue, stack)
+}))
+```
+
+With a handler set, a panicking task is counted as finished and its worker continues with the next task. The handler is called synchronously by the worker and may query pool state such as `WaitingQueueSize`, but must not call `Stop`, `StopWait`, or `Pause`. If the handler itself panics, the panic propagates and crashes the program.
+
 ## Usage Note
 
 There is no upper limit on the number of tasks queued, other than the limits of system resources. If the number of inbound tasks is too many to even queue for pending processing, then the solution is outside the scope of workerpool. It should be solved by distributing workload over multiple systems, and/or storing input for pending processing in intermediate storage such as a file system, distributed message queue, etc.
