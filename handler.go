@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"time"
 )
 
 const (
@@ -47,6 +48,14 @@ type CSRFHandler struct {
 	// This should be a better solution of customizing the options
 	// than a bunch of methods SetCookieExpiration(), etc.
 	baseCookie http.Cookie
+
+	// Base cookies for read-only legacy cookie names,
+	// consulted while migrating away from old cookie names.
+	// Only Name, Path and Domain of each entry are used:
+	// the name is looked up in incoming requests and,
+	// upon migration, the cookie is deleted with the same
+	// Path and Domain it was presumably set with.
+	legacyCookies []http.Cookie
 
 	// Slices of paths that are exempt from CSRF checks.
 	// All of those will be matched against Request.URL.Path,
@@ -120,17 +129,98 @@ func (h CSRFHandler) getCookieName() string {
 	return CookieName
 }
 
+// cookieValues returns the values of all cookies in the request
+// that carry the given name. Multiple values occur when the client
+// sends several cookies with the same name (e.g. set under
+// different Path or Domain scopes).
+func cookieValues(r *http.Request, name string) []string {
+	var values []string
+	for _, cookie := range r.Cookies() {
+		if cookie.Name == name {
+			values = append(values, cookie.Value)
+		}
+	}
+	return values
+}
+
+// allStringsEqual reports whether every element of the slice
+// equals its first element. An empty or single-element slice
+// is trivially equal.
+func allStringsEqual(values []string) bool {
+	for _, v := range values[1:] {
+		if v != values[0] {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveToken determines the real token for the request and lists
+// the legacy cookies that took part and should be migrated away.
+//
+// The rules are:
+//
+//   - If the current-name cookie is present, it is authoritative.
+//     A corrupt or contradictory current cookie never falls back
+//     to legacy names.
+//   - Otherwise, the legacy names are consulted. The token is adopted
+//     only if every legacy cookie found agrees on a single value.
+//     Contradictory legacy cookies yield no token, so the CSRF check
+//     fails rather than picking one of them arbitrarily.
+//   - Several cookies sharing one name are treated the same way:
+//     identical duplicates are fine, contradictory ones yield no token.
+func (h *CSRFHandler) resolveToken(r *http.Request) (realToken []byte, legacyUsed []http.Cookie) {
+	currentName := h.getCookieName()
+
+	if values := cookieValues(r, currentName); len(values) > 0 {
+		if allStringsEqual(values) {
+			realToken = b64decode(values[0])
+		}
+		return realToken, nil
+	}
+
+	var values []string
+	for _, base := range h.legacyCookies {
+		if base.Name == "" || base.Name == currentName {
+			continue
+		}
+		vals := cookieValues(r, base.Name)
+		if len(vals) == 0 {
+			continue
+		}
+		legacyUsed = append(legacyUsed, base)
+		values = append(values, vals...)
+	}
+
+	if len(values) == 0 || !allStringsEqual(values) {
+		return nil, legacyUsed
+	}
+
+	return b64decode(values[0]), legacyUsed
+}
+
+// deleteLegacyCookie writes an expired cookie for the given legacy
+// base cookie, reusing its Path and Domain so that the deletion
+// targets the same scope the legacy cookie was set in, instead of
+// accidentally deleting a same-named cookie in another scope.
+func (h *CSRFHandler) deleteLegacyCookie(w http.ResponseWriter, base http.Cookie) {
+	cookie := &http.Cookie{
+		Name:    base.Name,
+		Value:   "",
+		Path:    base.Path,
+		Domain:  base.Domain,
+		Expires: time.Unix(1, 0),
+		MaxAge:  -1,
+	}
+	http.SetCookie(w, cookie)
+}
+
 func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = addNosurfContext(r)
 	defer ctxClear(r)
 	w.Header().Add("Vary", "Cookie")
 
-	var realToken []byte
-
-	tokenCookie, err := r.Cookie(h.getCookieName())
-	if err == nil {
-		realToken = b64decode(tokenCookie.Value)
-	}
+	realToken, legacyUsed := h.resolveToken(r)
 
 	// If the length of the real token isn't what it should be,
 	// it has either been tampered with,
@@ -144,6 +234,18 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.RegenerateToken(w, r)
 	} else {
 		ctxSetToken(r, realToken)
+		if len(legacyUsed) > 0 {
+			// The token came from a legacy cookie:
+			// migrate it to the current name.
+			h.setTokenCookie(w, r, realToken)
+		}
+	}
+
+	// Delete the legacy cookies that took part, each within
+	// its own Path/Domain scope. The response only ever writes
+	// the current cookie name.
+	for _, base := range legacyUsed {
+		h.deleteLegacyCookie(w, base)
 	}
 
 	if sContains(safeMethods, r.Method) || h.IsExempt(r) {
@@ -283,6 +385,35 @@ func (h *CSRFHandler) SetFailureHandler(handler http.Handler) {
 // This way you can specify the Domain, Path, HttpOnly, Secure, etc.
 func (h *CSRFHandler) SetBaseCookie(cookie http.Cookie) {
 	h.baseCookie = cookie
+}
+
+// SetLegacyCookies sets the read-only legacy cookie names that are
+// still accepted while migrating to the current cookie name.
+//
+// Each entry only needs its Name set; Path and Domain should match
+// the scope the legacy cookie was originally set with, so that the
+// deletion cookie issued upon migration targets that exact scope
+// instead of a same-named cookie living in another scope.
+//
+// During the compatibility period:
+//
+//   - Responses only ever write the current cookie name.
+//   - A request carrying the current name is validated against it
+//     alone; legacy names are ignored, even if the current cookie
+//     is corrupt.
+//   - A request carrying only legacy names is validated against them
+//     and, on success, migrated: the token is re-issued under the
+//     current name and the legacy cookies are deleted.
+//   - Multiple contradictory cookies (several legacy names, or
+//     duplicate cookies sharing one name, with different values)
+//     never validate: the request fails the CSRF check instead of
+//     picking one of them arbitrarily.
+//
+// To end the compatibility period, call SetLegacyCookies() with no
+// arguments (or never call it at all): legacy names then immediately
+// stop participating in validation.
+func (h *CSRFHandler) SetLegacyCookies(cookies ...http.Cookie) {
+	h.legacyCookies = cookies
 }
 
 // SetIsTLSFunc sets a delegate function which determines, on a per-request basis, whether the request is made over a secure connection.
