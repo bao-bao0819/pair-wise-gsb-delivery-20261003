@@ -22,7 +22,8 @@ type milterSession struct {
 	protocol OptProtocol
 	conn     net.Conn
 	headers  textproto.MIMEHeader
-	macros   map[string]string
+	macros   *macroStore
+	stage    Code
 	backend  Milter
 }
 
@@ -102,7 +103,8 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		// abort current message and start over
 		defer func() {
 			m.headers = nil
-			m.macros = nil
+			m.macros.clearAbort()
+			m.stage = CodeConn
 		}()
 		return nil, m.backend.Abort(newModifier(m))
 
@@ -111,6 +113,7 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		return m.backend.BodyChunk(msg.Data, newModifier(m))
 
 	case CodeConn:
+		m.stage = CodeConn
 		// new connection, get hostname
 		hostname := readCString(msg.Data)
 		msg.Data = msg.Data[len(hostname)+1:]
@@ -145,9 +148,14 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 
 	case CodeMacro:
 		// define macros
-		m.macros = make(map[string]string)
+		if len(msg.Data) < 1 {
+			return nil, nil
+		}
+		// first byte is the command code (stage) these macros apply to
+		stage := Code(msg.Data[0])
 		// convert data to Go strings
 		data := decodeCStrings(msg.Data[1:])
+		kv := make(map[string]string, (len(data)+1)/2)
 		if len(data) != 0 {
 			if len(data)%2 == 1 {
 				data = append(data, "")
@@ -155,17 +163,22 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 
 			// store data in a map
 			for i := 0; i < len(data); i += 2 {
-				m.macros[data[i]] = data[i+1]
+				kv[data[i]] = data[i+1]
 			}
 		}
+		m.macros.define(stage, kv)
 		// do not send response
 		return nil, nil
 
 	case CodeEOB:
+		m.stage = CodeEOB
+		// end of message, drop message-scoped macros afterwards
+		defer m.macros.clearMessage()
 		// call and return milter handler
 		return m.backend.Body(newModifier(m))
 
 	case CodeHelo:
+		m.stage = CodeHelo
 		// helo command
 		name := strings.TrimSuffix(string(msg.Data), null)
 		return m.backend.Helo(name, newModifier(m))
@@ -188,11 +201,13 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		}
 
 	case CodeMail:
+		m.stage = CodeMail
 		// envelope from address
 		from := readCString(msg.Data)
 		return m.backend.MailFrom(strings.Trim(from, "<>"), newModifier(m))
 
 	case CodeEOH:
+		m.stage = CodeEOH
 		// end of headers
 		return m.backend.Headers(m.headers, newModifier(m))
 
@@ -225,13 +240,24 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		// client requested session close
 		return nil, errCloseSession
 
+	case CodeQuitNewConn:
+		// client will reuse the socket for a new connection, reset all state
+		m.headers = nil
+		m.macros.clearAll()
+		m.stage = CodeConn
+		m.backend = m.server.NewMilter()
+		// do not send response
+		return nil, nil
+
 	case CodeRcpt:
+		m.stage = CodeRcpt
 		// envelope to address
 		to := readCString(msg.Data)
 		return m.backend.RcptTo(strings.Trim(to, "<>"), newModifier(m))
 
 	case CodeData:
-		// data, ignore
+		// data, only track the protocol stage
+		m.stage = CodeData
 
 	default:
 		// print error and close session
@@ -276,6 +302,8 @@ func (m *milterSession) HandleMilterCommands() {
 			if !resp.Continue() {
 				// prepare backend for next message
 				m.backend = m.server.NewMilter()
+				// drop message-scoped macros left over from this message
+				m.macros.clearMessage()
 			}
 		}
 	}

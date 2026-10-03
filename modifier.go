@@ -20,7 +20,20 @@ type Modifier struct {
 	Macros  map[string]string
 	Headers textproto.MIMEHeader
 
+	macros      *macroStore
+	stage       Code
 	writePacket func(*Message) error
+}
+
+// MacroStage returns the protocol stage (SMFIC_MACRO cmdcode) at which the
+// given macro visible in [Modifier.Macros] was defined. Macros of the
+// current stage shadow connection-level ones. The second return value is
+// false if the macro is not defined for the current callback.
+func (m *Modifier) MacroStage(name string) (Code, bool) {
+	if m.macros == nil {
+		return 0, false
+	}
+	return m.macros.stageOf(m.stage, name)
 }
 
 // AddRecipient appends a new envelope recipient for current message
@@ -89,8 +102,10 @@ func (m *Modifier) ChangeFrom(value string) error {
 // newModifier creates a new Modifier instance from milterSession
 func newModifier(s *milterSession) *Modifier {
 	return &Modifier{
-		Macros:      s.macros,
+		Macros:      s.macros.snapshot(s.stage),
 		Headers:     s.headers,
+		macros:      s.macros,
+		stage:       s.stage,
 		writePacket: s.WritePacket,
 	}
 }

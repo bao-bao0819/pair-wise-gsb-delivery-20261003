@@ -132,6 +132,7 @@ func (s *Server) Serve(ln net.Listener) error {
 			actions:  s.Actions,
 			protocol: s.Protocol,
 			conn:     conn,
+			macros:   newMacroStore(),
 			backend:  s.NewMilter(),
 		}
 		go session.HandleMilterCommands()
