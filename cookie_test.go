@@ -2,6 +2,7 @@ package httphead
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -363,4 +364,202 @@ func dumpActStd(act []cookieTuple, std []*http.Cookie) string {
 		fmt.Fprintf(&buf, "\t#%d: %#q=%#q\n", i, c.Name, c.Value)
 	}
 	return buf.String()
+}
+
+type cookieItemTuple struct {
+	name, value []byte
+	raw         []byte
+	offset      int
+	err         error
+}
+
+var cookieItemCases = []struct {
+	label  string
+	in     []byte
+	status CookieScanStatus
+	exp    []cookieItemTuple
+
+	c CookieScanner
+}{
+	{
+		label:  "lenient recovery",
+		in:     []byte(`foo=bar;bad@=x;;qux="oops;last=1`),
+		status: CookieScanComplete,
+		exp: []cookieItemTuple{
+			{name: []byte(`foo`), value: []byte(`bar`), raw: []byte(`foo=bar`), offset: 0},
+			{raw: []byte(`bad@=x`), offset: 8, err: ErrCookieInvalidName},
+			{raw: []byte(``), offset: 15, err: ErrCookieEmptyPair},
+			{raw: []byte(`qux="oops`), offset: 16, err: ErrCookieUnclosedQuote},
+			{name: []byte(`last`), value: []byte(`1`), raw: []byte(`last=1`), offset: 26},
+		},
+	},
+	{
+		label:  "bad pair equal sign is not a new cookie",
+		in:     []byte(`bad name=x=y; good=1`),
+		status: CookieScanComplete,
+		exp: []cookieItemTuple{
+			{raw: []byte(`bad name=x=y`), offset: 0, err: ErrCookieInvalidName},
+			{name: []byte(`good`), value: []byte(`1`), raw: []byte(`good=1`), offset: 14},
+		},
+	},
+	{
+		label:  "break on pair error",
+		in:     []byte(`foo=bar;bad name=1;baz=2`),
+		status: CookieScanError,
+		exp: []cookieItemTuple{
+			{name: []byte(`foo`), value: []byte(`bar`), raw: []byte(`foo=bar`), offset: 0},
+			{raw: []byte(`bad name=1`), offset: 8, err: ErrCookieInvalidName},
+		},
+		c: CookieScanner{
+			BreakOnPairError: true,
+		},
+	},
+	{
+		label:  "strict separator without space",
+		in:     []byte(`foo=bar;bar=baz`),
+		status: CookieScanError,
+		exp: []cookieItemTuple{
+			{name: []byte(`foo`), value: []byte(`bar`), raw: []byte(`foo=bar`), offset: 0},
+			{raw: []byte(`bar=baz`), offset: 8, err: ErrCookieInvalidSeparator},
+		},
+		c: CookieScanner{
+			Strict: true,
+		},
+	},
+	{
+		label:  "strict trailing semicolon",
+		in:     []byte(`foo=bar;`),
+		status: CookieScanError,
+		exp: []cookieItemTuple{
+			{name: []byte(`foo`), value: []byte(`bar`), raw: []byte(`foo=bar`), offset: 0},
+			{raw: []byte(``), offset: 8, err: ErrCookieInvalidSeparator},
+		},
+		c: CookieScanner{
+			Strict: true,
+		},
+	},
+	{
+		label:  "strict pairs without values",
+		in:     []byte(`foo; bar; baz=10`),
+		status: CookieScanComplete,
+		exp: []cookieItemTuple{
+			{raw: []byte(`foo`), offset: 0, err: ErrCookieNoValue},
+			{raw: []byte(`bar`), offset: 5, err: ErrCookieNoValue},
+			{name: []byte(`baz`), value: []byte(`10`), raw: []byte(`baz=10`), offset: 10},
+		},
+		c: CookieScanner{
+			Strict: true,
+		},
+	},
+	{
+		label:  "stray quote",
+		in:     []byte(`foo=bar"; ok=1`),
+		status: CookieScanComplete,
+		exp: []cookieItemTuple{
+			{raw: []byte(`foo=bar"`), offset: 0, err: ErrCookieInvalidValue},
+			{name: []byte(`ok`), value: []byte(`1`), raw: []byte(`ok=1`), offset: 10},
+		},
+	},
+}
+
+func TestScanCookieItems(t *testing.T) {
+	for _, test := range cookieItemCases {
+		t.Run(test.label, func(t *testing.T) {
+			var act []cookieItemTuple
+
+			status := test.c.ScanItems(test.in, func(item CookieItem) bool {
+				act = append(act, cookieItemTuple{
+					name:   item.Name,
+					value:  item.Value,
+					raw:    item.Raw,
+					offset: item.Offset,
+					err:    item.Err,
+				})
+				return true
+			})
+			if status != test.status {
+				t.Errorf("unexpected status: %v; want %v", status, test.status)
+			}
+			if an, en := len(act), len(test.exp); an != en {
+				t.Fatalf("unexpected number of items: %d; want %d", an, en)
+			}
+			for i, ev := range test.exp {
+				av := act[i]
+				switch {
+				case !bytes.Equal(av.name, ev.name):
+					t.Errorf("unexpected %d-th item name: %#q; want %#q", i, av.name, ev.name)
+				case !bytes.Equal(av.value, ev.value):
+					t.Errorf("unexpected %d-th item value: %#q; want %#q", i, av.value, ev.value)
+				case !bytes.Equal(av.raw, ev.raw):
+					t.Errorf("unexpected %d-th item raw: %#q; want %#q", i, av.raw, ev.raw)
+				case av.offset != ev.offset:
+					t.Errorf("unexpected %d-th item offset: %d; want %d", i, av.offset, ev.offset)
+				case !errors.Is(av.err, ev.err):
+					t.Errorf("unexpected %d-th item error: %v; want %v", i, av.err, ev.err)
+				}
+				if end := av.offset + len(av.raw); end > len(test.in) || av.offset < 0 {
+					t.Errorf("%d-th item range [%d:%d] is out of bounds", i, av.offset, end)
+				} else if !bytes.Equal(test.in[av.offset:end], av.raw) {
+					t.Errorf("%d-th item raw range mismatch", i)
+				}
+				if i > 0 {
+					if prev := act[i-1].offset + len(act[i-1].raw); av.offset < prev {
+						t.Errorf("%d-th item range overlaps with previous one", i)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestScanCookieItemsStop(t *testing.T) {
+	in := []byte(`a=1;b=2;c=3`)
+
+	var n int
+	status := ScanCookieItems(in, func(item CookieItem) bool {
+		n++
+		return false
+	})
+	if status != CookieScanStopped {
+		t.Errorf("unexpected status: %v; want %v", status, CookieScanStopped)
+	}
+	if n != 1 {
+		t.Errorf("unexpected number of items: %d; want 1", n)
+	}
+}
+
+func TestScanCookieItemsConsistentWithScan(t *testing.T) {
+	for _, test := range cookieCases {
+		t.Run(test.label, func(t *testing.T) {
+			var pairs []cookieTuple
+			ok := test.c.Scan(test.in, func(k, v []byte) bool {
+				pairs = append(pairs, cookieTuple{k, v})
+				return true
+			})
+
+			var valid []cookieTuple
+			status := test.c.ScanItems(test.in, func(item CookieItem) bool {
+				if item.Err == nil {
+					valid = append(valid, cookieTuple{item.Name, item.Value})
+				}
+				return true
+			})
+
+			if got, want := status != CookieScanError, ok; got != want {
+				t.Errorf("unexpected result: %v; want %v", got, want)
+			}
+			if an, en := len(valid), len(pairs); an != en {
+				t.Fatalf("unexpected number of valid items: %d; want %d", an, en)
+			}
+			for i, ev := range pairs {
+				if av := valid[i]; !bytes.Equal(av.name, ev.name) || !bytes.Equal(av.value, ev.value) {
+					t.Errorf(
+						"unexpected %d-th tuple: %#q=%#q; want %#q=%#q", i,
+						string(av.name), string(av.value),
+						string(ev.name), string(ev.value),
+					)
+				}
+			}
+		})
+	}
 }
