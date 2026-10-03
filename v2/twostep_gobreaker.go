@@ -29,6 +29,12 @@ func (tscb *TwoStepCircuitBreaker[T]) Counts() Counts {
 	return tscb.cb.Counts()
 }
 
+// Subscribe registers a callback that is invoked for every state transition
+// of the underlying CircuitBreaker. See CircuitBreaker.Subscribe.
+func (tscb *TwoStepCircuitBreaker[T]) Subscribe(fn func(StateTransition), opts ...SubscribeOptions) Subscription {
+	return tscb.cb.Subscribe(fn, opts...)
+}
+
 // Allow checks if a new request can proceed.
 // If the circuit breaker allow the new request, it returns a callback
 // used to register the error object that the request will return in a separate step.

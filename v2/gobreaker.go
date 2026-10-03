@@ -110,6 +110,17 @@ type CircuitBreaker[T any] struct {
 	counts     *rollingCounts
 	start      time.Time
 	expiry     time.Time
+
+	// transitionSeq is guarded by mutex.
+	transitionSeq uint64
+
+	// subMu guards subscribers and nextSubscriberID. It is never held
+	// while invoking subscriber callbacks, and it is only ever acquired
+	// after (never before) mutex, so subscriptions cannot deadlock with
+	// the internal state lock.
+	subMu            sync.Mutex
+	subscribers      map[uint64]*subscriber
+	nextSubscriberID uint64
 }
 
 // NewCircuitBreaker returns a new CircuitBreaker configured with the given Settings.
@@ -338,10 +349,33 @@ func (cb *CircuitBreaker[T]) setState(state State, now time.Time) {
 	prev := cb.state
 	cb.state = state
 
+	transition := StateTransition{
+		Name:   cb.name,
+		From:   prev,
+		To:     state,
+		Counts: cb.counts.Counts,
+		Time:   now,
+	}
+
 	cb.toNewGeneration(now)
+
+	cb.transitionSeq++
+	transition.Seq = cb.transitionSeq
+	cb.broadcast(transition)
 
 	if cb.onStateChange != nil {
 		cb.onStateChange(cb.name, prev, state)
+	}
+}
+
+// broadcast offers the transition to every current subscriber.
+// It never blocks: enqueue applies the OverflowPolicy of each subscription.
+func (cb *CircuitBreaker[T]) broadcast(t StateTransition) {
+	cb.subMu.Lock()
+	defer cb.subMu.Unlock()
+
+	for _, sub := range cb.subscribers {
+		sub.enqueue(t)
 	}
 }
 
