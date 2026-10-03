@@ -2548,6 +2548,51 @@ func TestGroup(t *testing.T) {
 	assert(t, res == `["123"]`)
 }
 
+func TestBucket(t *testing.T) {
+	json := `[
+		{"a":1,"b":"x:y","c":"p"},
+		{"a":"1","b":"x","c":"y:q"},
+		{"b":null,"c":"p"},
+		{"a":1,"b":"x:y","c":"p"},
+		{"b":"x:y","c":"p"}
+	]`
+	res := Get(json, "@bucket:a,b,c").Raw
+	assert(t, res == `[[[1,"x:y","p"],[{"a":1,"b":"x:y","c":"p"},{"a":1,"b":"x:y","c":"p"}]],[["1","x","y:q"],[{"a":"1","b":"x","c":"y:q"}]],[[null,null,"p"],[{"b":null,"c":"p"}]],[[null,"x:y","p"],[{"b":"x:y","c":"p"}]]]`)
+
+	json = `[
+		{"a":"1,","b":"2"},
+		{"a":"1","b":",2"},
+		{"a":"1","b":",2"}
+	]`
+	res = Get(json, `@bucket:a,b`).Raw
+	assert(t, res == `[[["1,","2"],[{"a":"1,","b":"2"}]],[["1",",2"],[{"a":"1","b":",2"},{"a":"1","b":",2"}]]]`)
+
+	json = `[
+		{"a":"he said, \"hi\"","b":"q"},
+		{"a":"he said, \"hi\"","b":"q"}
+	]`
+	res = Get(json, `@bucket:a,b`).Raw
+	assert(t, res == `[[["he said, \"hi\"","q"],[{"a":"he said, \"hi\"","b":"q"},{"a":"he said, \"hi\"","b":"q"}]]]`)
+
+	res = Get(json, `@groupby:a,b`).Raw
+	assert(t, res == `[[["he said, \"hi\"","q"],[{"a":"he said, \"hi\"","b":"q"},{"a":"he said, \"hi\"","b":"q"}]]]`)
+
+	json = `[{"a": 1, "n": "first"},{"a": 1, "n": "second"}]`
+	res = Get(json, "@bucket:a").Raw
+	assert(t, res == `[[[1],[{"a": 1, "n": "first"},{"a": 1, "n": "second"}]]]`)
+
+	json = `[{"a":1,"n":"one"},{"a":1.0,"n":"one-point-zero"},{"a":"1","n":"string"}]`
+	res = Get(json, "@bucket:a").Raw
+	assert(t, res == `[[[1],[{"a":1,"n":"one"},{"a":1.0,"n":"one-point-zero"}]],[["1"],[{"a":"1","n":"string"}]]]`)
+
+	json = `[{"a":"caf\u00e9","n":"escaped"},{"a":"café","n":"literal"}]`
+	res = Get(json, "@bucket:a").Raw
+	assert(t, res == `[[["caf\u00e9"],[{"a":"caf\u00e9","n":"escaped"},{"a":"café","n":"literal"}]]]`)
+
+	assert(t, Get(`[]`, "@bucket:a").Raw == `[]`)
+	assert(t, Get(`{"a":1}`, "@bucket:a").Raw == `[]`)
+}
+
 func goJSONMarshal(i interface{}) ([]byte, error) {
 	buffer := &bytes.Buffer{}
 	encoder := json.NewEncoder(buffer)

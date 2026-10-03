@@ -10,6 +10,7 @@ package gjson
 import (
 	"iter"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -2976,6 +2977,8 @@ func init() {
 		"tostr":   modToStr,
 		"fromstr": modFromStr,
 		"group":   modGroup,
+		"bucket":  modBucket,
+		"groupby": modBucket,
 		"dig":     modDig,
 	}
 }
@@ -3325,6 +3328,202 @@ func modGroup(json, arg string) string {
 	}
 	data = append(data, ']')
 	return string(data)
+}
+
+// modBucket groups array members by the values at one or more paths.
+func modBucket(json, arg string) string {
+	res := Parse(json)
+	if !res.IsArray() {
+		return "[]"
+	}
+	paths := parseBucketPaths(arg)
+	if len(paths) == 0 {
+		return "[]"
+	}
+
+	type bucket struct {
+		key     []byte
+		members []byte
+	}
+	var buckets []bucket
+	bucketIndex := make(map[string]int)
+
+	res.ForEach(func(_, member Result) bool {
+		key := make([]byte, 0, 1+len(paths)*16)
+		mapKey := make([]byte, 0, len(paths)*16)
+		key = append(key, '[')
+		for i, path := range paths {
+			if i > 0 {
+				key = append(key, ',')
+			}
+			value := Get(member.Raw, path)
+			if value.Exists() {
+				key = append(key, value.Raw...)
+			} else {
+				key = append(key, "null"...)
+			}
+			mapKey = appendBucketMapKey(mapKey, value)
+		}
+		key = append(key, ']')
+
+		idx, ok := bucketIndex[string(mapKey)]
+		if !ok {
+			idx = len(buckets)
+			bucketIndex[string(mapKey)] = idx
+			buckets = append(buckets, bucket{key: key})
+		}
+		if len(buckets[idx].members) > 0 {
+			buckets[idx].members = append(buckets[idx].members, ',')
+		}
+		buckets[idx].members = append(buckets[idx].members, member.Raw...)
+		return true
+	})
+
+	out := make([]byte, 0, len(buckets)*32)
+	out = append(out, '[')
+	for i, bucket := range buckets {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, '[')
+		out = append(out, bucket.key...)
+		out = append(out, ',', '[')
+		out = append(out, bucket.members...)
+		out = append(out, ']', ']')
+	}
+	out = append(out, ']')
+	return string(out)
+}
+
+func parseBucketPaths(arg string) []string {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil
+	}
+	switch arg[0] {
+	case '[':
+		values := Parse(arg)
+		if values.IsArray() {
+			var paths []string
+			values.ForEach(func(_, value Result) bool {
+				if value.Type == String {
+					paths = append(paths, value.Str)
+				}
+				return true
+			})
+			return paths
+		}
+	case '"':
+		value := Parse(arg)
+		if value.Type == String {
+			return []string{value.Str}
+		}
+	}
+
+	var paths []string
+	var depth int
+	start := 0
+	for i := 0; i < len(arg); i++ {
+		switch arg[i] {
+		case '"':
+			i++
+			for i < len(arg) {
+				if arg[i] == '\\' {
+					i++
+				} else if arg[i] == '"' {
+					break
+				}
+				i++
+			}
+		case '{', '[', '(':
+			depth++
+		case '}', ']', ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				if path := strings.TrimSpace(arg[start:i]); path != "" {
+					paths = append(paths, path)
+				}
+				start = i + 1
+			}
+		}
+	}
+	if path := strings.TrimSpace(arg[start:]); path != "" {
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func appendBucketMapKey(dst []byte, value Result) []byte {
+	if !value.Exists() {
+		return append(dst, 'm')
+	}
+	var tag byte
+	var body []byte
+	switch value.Type {
+	case Null:
+		tag = 'n'
+	case False:
+		tag = 'f'
+	case Number:
+		tag = '#'
+		body = strconv.AppendFloat(nil, value.Num, 'f', -1, 64)
+	case String:
+		tag = 's'
+		body = stringBytes(value.Str)
+	case True:
+		tag = 't'
+	case JSON:
+		if value.IsArray() {
+			tag = '['
+			value.ForEach(func(_, item Result) bool {
+				body = appendBucketMapKey(body, item)
+				return true
+			})
+		} else {
+			tag = '{'
+			type objectKey struct {
+				key   string
+				value Result
+			}
+			var keys []objectKey
+			value.ForEach(func(key, item Result) bool {
+				idx := -1
+				for i := range keys {
+					if keys[i].key == key.Str {
+						idx = i
+						break
+					}
+				}
+				if idx == -1 {
+					keys = append(keys, objectKey{key.Str, item})
+				} else {
+					keys[idx].value = item
+				}
+				return true
+			})
+			sort.Slice(keys, func(i, j int) bool {
+				return keys[i].key < keys[j].key
+			})
+			for _, item := range keys {
+				body = appendBucketStringKey(body, item.key)
+				body = appendBucketMapKey(body, item.value)
+			}
+		}
+	}
+	dst = append(dst, tag)
+	dst = strconv.AppendInt(dst, int64(len(body)), 10)
+	dst = append(dst, ':')
+	return append(dst, body...)
+}
+
+func appendBucketStringKey(dst []byte, value string) []byte {
+	dst = append(dst, 's')
+	dst = strconv.AppendInt(dst, int64(len(value)), 10)
+	dst = append(dst, ':')
+	return append(dst, value...)
 }
 
 // stringHeader instead of reflect.StringHeader
