@@ -386,6 +386,21 @@ type DecoderConfig struct {
 type Decoder struct {
 	config           *DecoderConfig
 	cachedDecodeHook func(from reflect.Value, to reflect.Value) (any, error)
+
+	// unusedPath tracks the path of the value currently being decoded so
+	// that unconsumed input can be recorded at the correct location in
+	// Metadata.UnusedValues. It is only maintained when Metadata is set.
+	unusedPath []unusedPathSegment
+
+	// unusedValues accumulates the unconsumed input values found during
+	// decoding. It is turned into a tree in Decode.
+	unusedValues []unusedValue
+
+	// suppressUnusedRecord disables the automatic recording of unconsumed
+	// input in decode while it is greater than zero. It is used when the
+	// caller records a more useful value itself (e.g. map keys that failed
+	// to decode record the associated value instead of the key).
+	suppressUnusedRecord int
 }
 
 // Metadata contains information about decoding a structure that
@@ -402,6 +417,23 @@ type Metadata struct {
 	// but weren't set in the decoding process since there was no matching value
 	// in the input
 	Unset []string
+
+	// UnusedValues is a tree of the input values that were not consumed
+	// during decoding, preserving the hierarchy and types of the original
+	// input. It holds the same information as Unused, but structured so it
+	// can be handed to other components for further decoding of extension
+	// configuration.
+	//
+	// Map nodes are map[string]any, unless the input at that level
+	// contains non-string keys, in which case the node is a map[any]any.
+	// Slice nodes are []any with unconsumed elements kept at their
+	// original indexes. Keys captured by a ",remain" field are considered
+	// consumed and are not included. Values that failed to decode are
+	// considered unconsumed and are included.
+	//
+	// The tree is a deep copy of the unconsumed input: mutating it does
+	// not affect the original input and vice versa.
+	UnusedValues map[string]any
 }
 
 // Decode takes an input structure and uses reflection to translate it to
@@ -497,6 +529,10 @@ func NewDecoder(config *DecoderConfig) (*Decoder, error) {
 		if config.Metadata.Unset == nil {
 			config.Metadata.Unset = make([]string, 0)
 		}
+
+		if config.Metadata.UnusedValues == nil {
+			config.Metadata.UnusedValues = make(map[string]any)
+		}
 	}
 
 	if config.TagName == "" {
@@ -531,6 +567,10 @@ func NewDecoder(config *DecoderConfig) (*Decoder, error) {
 // by the configuration.
 func (d *Decoder) Decode(input any) error {
 	err := d.decode(d.config.RootName, input, reflect.ValueOf(d.config.Result).Elem())
+
+	if d.config.Metadata != nil {
+		d.config.Metadata.UnusedValues = buildUnusedValueTree(d.unusedValues)
+	}
 
 	// Retain some of the original behavior when multiple errors ocurr
 	var joinedErr interface{ Unwrap() []error }
@@ -655,6 +695,16 @@ func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
 		default:
 			// If we reached this point then we weren't able to decode it
 			return newDecodeError(name, fmt.Errorf("unsupported type: %s", outputKind))
+		}
+	}
+
+	// If decoding failed at this level (as opposed to an error that
+	// originated deeper and was joined), the input was not consumed, so
+	// record it for Metadata.UnusedValues.
+	if err != nil && d.config.Metadata != nil && d.suppressUnusedRecord == 0 {
+		var joinedErr interface{ Unwrap() []error }
+		if !errors.As(err, &joinedErr) {
+			d.recordUnusedValue(d.unusedPath, input)
 		}
 	}
 
@@ -1066,9 +1116,11 @@ func (d *Decoder) decodeMapFromSlice(name string, dataVal reflect.Value, val ref
 	}
 
 	for i := 0; i < dataVal.Len(); i++ {
+		d.pushUnusedPath(unusedPathSegment{index: i, isIndex: true})
 		err := d.decode(
 			name+"["+strconv.Itoa(i)+"]",
 			dataVal.Index(i).Interface(), val)
+		d.popUnusedPath()
 		if err != nil {
 			return err
 		}
@@ -1102,21 +1154,33 @@ func (d *Decoder) decodeMapFromMap(name string, dataVal reflect.Value, val refle
 	for _, k := range dataVal.MapKeys() {
 		fieldName := name + "[" + k.String() + "]"
 
-		// First decode the key into the proper type
-		currentKey := reflect.Indirect(reflect.New(valKeyType))
-		if err := d.decode(fieldName, k.Interface(), currentKey); err != nil {
-			errs = append(errs, err)
-			continue
-		}
+		d.pushUnusedPath(unusedPathSegment{key: k.Interface()})
 
 		// Next decode the data into the proper type
 		v := dataVal.MapIndex(k).Interface()
+
+		// First decode the key into the proper type
+		currentKey := reflect.Indirect(reflect.New(valKeyType))
+		d.suppressUnusedRecord++
+		if err := d.decode(fieldName, k.Interface(), currentKey); err != nil {
+			d.suppressUnusedRecord--
+			// The key could not be decoded, so the whole entry was not
+			// consumed. Record the value under the raw key.
+			d.recordUnusedValue(d.unusedPath, v)
+			errs = append(errs, err)
+			d.popUnusedPath()
+			continue
+		}
+		d.suppressUnusedRecord--
+
 		currentVal := reflect.Indirect(reflect.New(valElemType))
 		if err := d.decode(fieldName, v, currentVal); err != nil {
 			errs = append(errs, err)
+			d.popUnusedPath()
 			continue
 		}
 
+		d.popUnusedPath()
 		valMap.SetMapIndex(currentKey, currentVal)
 	}
 
@@ -1239,7 +1303,9 @@ func (d *Decoder) decodeMapFromStruct(name string, dataVal reflect.Value, val re
 			addrVal := reflect.New(vMap.Type())
 			reflect.Indirect(addrVal).Set(vMap)
 
+			d.pushUnusedPath(unusedPathSegment{key: keyName})
 			err := d.decode(keyName, x.Interface(), reflect.Indirect(addrVal))
+			d.popUnusedPath()
 			if err != nil {
 				return err
 			}
@@ -1275,7 +1341,9 @@ func (d *Decoder) decodeMapFromStruct(name string, dataVal reflect.Value, val re
 				if v.Len() > 0 {
 					reflect.Indirect(addrVal).Set(vSlice)
 
+					d.pushUnusedPath(unusedPathSegment{key: keyName})
 					err := d.decode(keyName, v.Interface(), reflect.Indirect(addrVal))
+					d.popUnusedPath()
 					if err != nil {
 						return err
 					}
@@ -1427,9 +1495,11 @@ func (d *Decoder) decodeSlice(name string, data any, val reflect.Value) error {
 		currentField := valSlice.Index(i)
 
 		fieldName := name + "[" + strconv.Itoa(i) + "]"
+		d.pushUnusedPath(unusedPathSegment{index: i, isIndex: true})
 		if err := d.decode(fieldName, currentData, currentField); err != nil {
 			errs = append(errs, err)
 		}
+		d.popUnusedPath()
 	}
 
 	// Finally, set the value to the slice we built up
@@ -1488,9 +1558,11 @@ func (d *Decoder) decodeArray(name string, data any, val reflect.Value) error {
 		currentField := valArray.Index(i)
 
 		fieldName := name + "[" + strconv.Itoa(i) + "]"
+		d.pushUnusedPath(unusedPathSegment{index: i, isIndex: true})
 		if err := d.decode(fieldName, currentData, currentField); err != nil {
 			errs = append(errs, err)
 		}
+		d.popUnusedPath()
 	}
 
 	// Finally, set the value to the array we built up
@@ -1718,9 +1790,11 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			fieldName = name + "." + fieldName
 		}
 
+		d.pushUnusedPath(unusedPathSegment{key: rawMapKey.Interface()})
 		if err := d.decode(fieldName, rawMapVal.Interface(), fieldValue); err != nil {
 			errs = append(errs, err)
 		}
+		d.popUnusedPath()
 	}
 
 	// If we have a "remain"-tagged field and we have unused keys then
@@ -1742,10 +1816,23 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 		dataValKeysUnused = nil
 	}
 
+	// Record the unconsumed input values so they can be exposed as a tree
+	// in Metadata.UnusedValues. This happens before the error check below
+	// so that partially failed decodes (e.g. a single bad element in a
+	// slice) don't lose the values that were left unconsumed.
+	if d.config.Metadata != nil {
+		for rawKey := range dataValKeysUnused {
+			d.recordUnusedValue(
+				append(d.unusedPath, unusedPathSegment{key: rawKey}),
+				mapIndexForKey(dataVal, rawKey).Interface(),
+			)
+		}
+	}
+
 	if d.config.ErrorUnused && len(dataValKeysUnused) > 0 {
 		keys := make([]string, 0, len(dataValKeysUnused))
 		for rawKey := range dataValKeysUnused {
-			keys = append(keys, rawKey.(string))
+			keys = append(keys, metadataKeyString(rawKey))
 		}
 		sort.Strings(keys)
 
@@ -1781,7 +1868,7 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 	// Add the unused keys to the list of unused keys if we're tracking metadata
 	if d.config.Metadata != nil {
 		for rawKey := range dataValKeysUnused {
-			key := rawKey.(string)
+			key := metadataKeyString(rawKey)
 			if name != "" {
 				key = name + "." + key
 			}
