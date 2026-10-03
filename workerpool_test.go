@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -629,6 +630,235 @@ func TestWorkerLeak(t *testing.T) {
 	})
 }
 
+func TestFence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4)
+		defer wp.Stop()
+
+		// A fence on an idle pool is satisfied immediately.
+		if err := wp.Fence().Wait(context.Background()); err != nil {
+			t.Fatal("fence on idle pool should be satisfied:", err)
+		}
+
+		release := make(chan struct{})
+		var ran atomic.Int32
+		for range 10 {
+			wp.Submit(func() {
+				<-release
+				ran.Add(1)
+			})
+		}
+		fence := wp.Fence()
+
+		// Tasks submitted after the fence are not covered by it.
+		var extra atomic.Int32
+		for range 5 {
+			wp.Submit(func() { extra.Add(1) })
+		}
+
+		waitDone := make(chan error, 1)
+		go func() {
+			waitDone <- fence.Wait(context.Background())
+		}()
+		synctest.Wait()
+
+		select {
+		case err := <-waitDone:
+			t.Fatal("fence satisfied before covered tasks completed:", err)
+		default:
+		}
+
+		close(release)
+		if err := <-waitDone; err != nil {
+			t.Fatal("fence wait failed:", err)
+		}
+		if ran.Load() != 10 {
+			t.Fatal("fence returned before all covered tasks ran:", ran.Load())
+		}
+	})
+}
+
+func TestFenceHoles(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4)
+		defer wp.Stop()
+
+		blocker := make(chan struct{})
+		wp.Submit(func() { <-blocker })
+		fence := wp.Fence()
+
+		// Later tasks complete before the blocked earlier task; the fence
+		// must not jump over the hole.
+		done := make(chan struct{}, 8)
+		for range 8 {
+			wp.Submit(func() { done <- struct{}{} })
+		}
+		for range 8 {
+			<-done
+		}
+
+		waitDone := make(chan error, 1)
+		go func() {
+			waitDone <- fence.Wait(context.Background())
+		}()
+		synctest.Wait()
+
+		select {
+		case err := <-waitDone:
+			t.Fatal("fence jumped over an unfinished earlier task:", err)
+		default:
+		}
+
+		// Only the unmerged out-of-order completions are retained.
+		wp.tracker.mu.Lock()
+		holes := len(wp.tracker.pending)
+		wp.tracker.mu.Unlock()
+		if holes != 8 {
+			t.Fatal("expected 8 pending holes, got", holes)
+		}
+
+		close(blocker)
+		if err := <-waitDone; err != nil {
+			t.Fatal("fence wait failed:", err)
+		}
+
+		synctest.Wait()
+		wp.tracker.mu.Lock()
+		holes = len(wp.tracker.pending)
+		wp.tracker.mu.Unlock()
+		if holes != 0 {
+			t.Fatal("pending holes not merged into watermark:", holes)
+		}
+	})
+}
+
+func TestFenceConcurrentAndCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4)
+		defer wp.Stop()
+
+		release1 := make(chan struct{})
+		for range 4 {
+			wp.Submit(func() { <-release1 })
+		}
+		fence1 := wp.Fence()
+
+		release2 := make(chan struct{})
+		for range 4 {
+			wp.Submit(func() { <-release2 })
+		}
+		fence2 := wp.Fence()
+
+		// Multiple fences can be waited on in parallel.
+		errs := make(chan error, 2)
+		go func() { errs <- fence1.Wait(context.Background()) }()
+		go func() { errs <- fence2.Wait(context.Background()) }()
+
+		// A canceled context unblocks Wait without satisfying the fence.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancelErr := make(chan error, 1)
+		go func() { cancelErr <- fence1.Wait(ctx) }()
+		synctest.Wait()
+		cancel()
+		if err := <-cancelErr; !errors.Is(err, context.Canceled) {
+			t.Fatal("expected context.Canceled, got", err)
+		}
+
+		close(release1)
+		synctest.Wait()
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatal("fence1 wait failed:", err)
+			}
+		default:
+			t.Fatal("fence1 should be satisfied")
+		}
+		select {
+		case err := <-errs:
+			t.Fatal("fence2 satisfied before its tasks completed:", err)
+		default:
+		}
+
+		close(release2)
+		if err := <-errs; err != nil {
+			t.Fatal("fence2 wait failed:", err)
+		}
+	})
+}
+
+func TestFenceStopDiscard(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(2)
+
+		release := make(chan struct{})
+		for range 2 {
+			wp.Submit(func() { <-release })
+		}
+		// Fence covering only the running tasks.
+		runningFence := wp.Fence()
+
+		// Queue tasks that Stop will discard.
+		for range 5 {
+			wp.Submit(func() {})
+		}
+		queuedFence := wp.Fence()
+		synctest.Wait()
+
+		runningErr := make(chan error, 1)
+		queuedErr := make(chan error, 1)
+		go func() { runningErr <- runningFence.Wait(context.Background()) }()
+		go func() { queuedErr <- queuedFence.Wait(context.Background()) }()
+
+		stopped := make(chan struct{})
+		go func() {
+			wp.Stop()
+			close(stopped)
+		}()
+		synctest.Wait()
+
+		// The fence covering discarded queued tasks fails immediately.
+		if err := <-queuedErr; !errors.Is(err, ErrFenceDiscarded) {
+			t.Fatal("expected ErrFenceDiscarded, got", err)
+		}
+
+		// The fence covering only running tasks is still waiting.
+		select {
+		case err := <-runningErr:
+			t.Fatal("fence over running tasks should not be discarded:", err)
+		default:
+		}
+
+		close(release)
+		<-stopped
+		if err := <-runningErr; err != nil {
+			t.Fatal("fence over running tasks failed:", err)
+		}
+	})
+}
+
+func TestFenceAfterStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(2)
+		wp.StopWait()
+
+		// A fence taken after StopWait covers only completed tasks.
+		if err := wp.Fence().Wait(context.Background()); err != nil {
+			t.Fatal("fence after StopWait should be satisfied:", err)
+		}
+
+		// A task rejected by the stopped pool must not leave a hole.
+		wp = New(1)
+		wp.Stop()
+		if err := wp.Do(func() { t.Error("task ran after Stop") }); !errors.Is(err, ErrStopped) {
+			t.Fatal("expected ErrStopped, got", err)
+		}
+		if err := wp.Fence().Wait(context.Background()); err != nil {
+			t.Fatal("fence should not wait on a rejected task:", err)
+		}
+	})
+}
+
 func TestPanicDo(t *testing.T) {
 	wp := New(1)
 	wp.Stop()
@@ -684,7 +914,7 @@ func anyReady(w *WorkerPool) bool {
 		<-release
 	}
 	select {
-	case w.workerQueue <- wait:
+	case w.workerQueue <- poolTask{fn: wait}:
 		close(release)
 		return true
 	default:
@@ -702,7 +932,7 @@ func countReady(w *WorkerPool) int {
 	var readyCount int
 	for i := 0; i < max; i++ {
 		select {
-		case w.workerQueue <- wait:
+		case w.workerQueue <- poolTask{fn: wait}:
 			readyCount++
 		case <-timeout:
 			i = max

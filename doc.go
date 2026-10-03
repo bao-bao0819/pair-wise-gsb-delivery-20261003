@@ -38,6 +38,17 @@ the dispatcher. This is done until there are no more workers to remove. The
 minimum number of workers is always zero, because the time to start new workers
 is insignificant.
 
+Fences
+
+A Fence, obtained by calling WorkerPool.Fence, covers all tasks accepted by
+the pool at the moment the fence is taken. Waiting on a fence blocks until
+those tasks complete, without stopping the pool or preventing new tasks from
+being submitted. This makes fences suitable for batch processing that must
+wait for "everything submitted so far" before submitting more work. Multiple
+fences can be waited on concurrently, and Fence.Wait supports cancellation
+via a Context. Tasks discarded by Stop cause fences covering them to fail
+with ErrFenceDiscarded instead of waiting forever.
+
 Usage note
 
 It is advisable to use different worker pools for tasks that are bound by

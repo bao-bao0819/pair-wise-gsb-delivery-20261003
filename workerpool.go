@@ -32,10 +32,11 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 
 	pool := &WorkerPool{
 		maxWorkers:  maxWorkers,
-		taskQueue:   make(chan func()),
-		workerQueue: make(chan func()),
+		taskQueue:   make(chan poolTask),
+		workerQueue: make(chan poolTask),
 		stopSignal:  make(chan struct{}),
 		stoppedChan: make(chan struct{}),
+		tracker:     newFenceTracker(),
 	}
 
 	// Start the task dispatcher.
@@ -48,16 +49,25 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 // goroutines processing requests does not exceed the specified maximum.
 type WorkerPool struct {
 	maxWorkers   int
-	taskQueue    chan func()
-	workerQueue  chan func()
+	taskQueue    chan poolTask
+	workerQueue  chan poolTask
 	stoppedChan  chan struct{}
 	stopSignal   chan struct{}
-	waitingQueue deque.Deque[func()]
+	waitingQueue deque.Deque[poolTask]
 	stopLock     sync.Mutex
 	stopOnce     sync.Once
 	stopped      bool
 	waiting      atomic.Int32
 	wait         bool
+	tracker      *fenceTracker
+}
+
+// poolTask is a unit of work routed through the pool's queues. The seq field
+// is the submission sequence number used for fence tracking; it is zero for
+// internal tasks, such as those submitted by Pause, that fences do not track.
+type poolTask struct {
+	seq uint64
+	fn  func()
 }
 
 // Size returns the maximum number of concurrent workers.
@@ -114,12 +124,17 @@ func (p *WorkerPool) Do(task func()) (err error) {
 	if task == nil {
 		return
 	}
+	seq, tracked := p.tracker.submit(task)
 	defer func() {
 		if recover() != nil {
+			// The pool stopped before accepting the task, so release the
+			// sequence number to keep fences from waiting on a task that
+			// will never run.
+			p.tracker.complete(seq)
 			err = ErrStopped
 		}
 	}()
-	p.taskQueue <- task
+	p.taskQueue <- poolTask{seq: seq, fn: tracked}
 	return
 }
 
@@ -171,12 +186,14 @@ func (p *WorkerPool) Pause(ctx context.Context) {
 	ready := new(sync.WaitGroup)
 	ready.Add(p.maxWorkers)
 	for i := 0; i < p.maxWorkers; i++ {
-		p.taskQueue <- func() {
-			ready.Done()
-			select {
-			case <-ctx.Done():
-			case <-p.stopSignal:
-			}
+		p.taskQueue <- poolTask{
+			fn: func() {
+				ready.Done()
+				select {
+				case <-ctx.Done():
+				case <-p.stopSignal:
+				}
+			},
 		}
 	}
 	// Wait for workers to all be paused
@@ -248,20 +265,22 @@ Loop:
 	// If instructed to wait, then run tasks that are already queued.
 	if p.wait {
 		p.runQueuedTasks()
+	} else {
+		p.discardQueuedTasks()
 	}
 
 	// Stop all remaining workers as they become ready.
 	for workerCount > 0 {
-		p.workerQueue <- nil
+		p.workerQueue <- poolTask{}
 		workerCount--
 	}
 	wg.Wait()
 }
 
 // worker executes tasks and stops when it receives a nil task.
-func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
-	for task != nil {
-		task()
+func worker(task poolTask, workerQueue chan poolTask, wg *sync.WaitGroup) {
+	for task.fn != nil {
+		task.fn()
 		task = <-workerQueue
 	}
 	wg.Done()
@@ -308,7 +327,7 @@ func (p *WorkerPool) processWaitingQueue() bool {
 
 func (p *WorkerPool) killIdleWorker() bool {
 	select {
-	case p.workerQueue <- nil:
+	case p.workerQueue <- poolTask{}:
 		// Sent kill signal to worker.
 		return true
 	default:
@@ -325,4 +344,20 @@ func (p *WorkerPool) runQueuedTasks() {
 		p.workerQueue <- p.waitingQueue.PopFront()
 		p.waiting.Store(int32(p.waitingQueue.Len()))
 	}
+}
+
+// discardQueuedTasks reports every queued task as discarded so that fences
+// covering them fail with ErrFenceDiscarded instead of waiting forever.
+func (p *WorkerPool) discardQueuedTasks() {
+	n := p.waitingQueue.Len()
+	if n == 0 {
+		return
+	}
+	seqs := make([]uint64, 0, n)
+	for i := range n {
+		if seq := p.waitingQueue.At(i).seq; seq != 0 {
+			seqs = append(seqs, seq)
+		}
+	}
+	p.tracker.discardAll(seqs)
 }

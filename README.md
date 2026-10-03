@@ -47,6 +47,25 @@ func main() {
 
 [Example wrapper function](https://go.dev/play/p/BWnRhJYarZ1) to show start and finish time of submitted function.
 
+## Fences
+
+Use `Fence` to wait for all tasks submitted so far without stopping the pool. A fence only covers tasks accepted at the moment it is taken, so it can be taken repeatedly between batches of submissions. `Fence.Wait` supports context cancellation, and multiple fences can be waited on concurrently. If `Stop` discards queued tasks covered by a fence, `Wait` returns `ErrFenceDiscarded`.
+
+```go
+wp := workerpool.New(4)
+defer wp.StopWait()
+
+for batch := range batches {
+	for _, item := range batch {
+		wp.Submit(func() { process(item) })
+	}
+	// Wait for everything submitted so far, then keep submitting.
+	if err := wp.Fence().Wait(context.Background()); err != nil {
+		return err
+	}
+}
+```
+
 ## Usage Note
 
 There is no upper limit on the number of tasks queued, other than the limits of system resources. If the number of inbound tasks is too many to even queue for pending processing, then the solution is outside the scope of workerpool. It should be solved by distributing workload over multiple systems, and/or storing input for pending processing in intermediate storage such as a file system, distributed message queue, etc.
