@@ -28,6 +28,7 @@ type Sketch struct {
 	tmpSet     set
 	sparseList *compressedList
 	regs       []uint8
+	generation uint64
 }
 
 // New returns a HyperLogLog Sketch with 2^14 registers (precision 14)
@@ -564,8 +565,10 @@ func (sk *Sketch) unmarshalBinaryV2(data []byte) error {
 }
 
 // Reset clears the sketch while preserving its current representation and
-// allocated backing storage.
+// allocated backing storage. Reset starts a new generation: deltas exported
+// before the reset no longer apply to the sketch. See ApplyDelta.
 func (sk *Sketch) Reset() {
+	sk.generation++
 	if sk.sparse() {
 		sk.tmpSet.clear()
 		sk.sparseList.clear()
