@@ -55,6 +55,26 @@ waiting task, allowing a much higher number of waiting tasks. Also, using a
 waiting queue ensures that tasks are given to workers in the order the tasks
 were received.
 
+Fences
+
+A Fence lets a caller wait for the completion of just the tasks submitted up
+to a point, while keeping the pool running so more work can be submitted
+afterwards. WorkerPool.Fence returns a Fence covering only the tasks that the
+dispatcher had already received at that instant; tasks submitted later do not
+delay it. Multiple fences may be created and awaited concurrently, and waiting
+supports Context cancellation.
+
+Fences track an ordered completion watermark. A task that finishes while an
+earlier task is still outstanding is remembered as a hole and merged into the
+watermark as soon as the gap closes, so a later task completing first never
+releases an older fence prematurely. The bookkeeping memory is proportional to
+the currently unmerged holes, not to the total number of tasks ever run.
+
+Stopping the pool with StopWait completes every queued task and satisfies
+outstanding fences. Stopping with Stop discards queued tasks, and any fence
+that covered a discarded task resolves with ErrFenceDropped instead of
+waiting forever.
+
 Credits
 
 This implementation builds on ideas from the following:

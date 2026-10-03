@@ -12,6 +12,11 @@ import (
 
 var ErrStopped = errors.New("submitting work to stopped workerpool")
 
+// ErrFenceDropped is returned by Fence.Wait when one or more of the tasks
+// covered by the fence were discarded because the worker pool was stopped with
+// Stop. A fence created after the pool is stopped also reports this error.
+var ErrFenceDropped = errors.New("fence reached discarded tasks")
+
 // New creates and starts a pool of worker goroutines.
 //
 // The maxWorkers parameter specifies the maximum number of workers that can
@@ -32,8 +37,8 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 
 	pool := &WorkerPool{
 		maxWorkers:  maxWorkers,
-		taskQueue:   make(chan func()),
-		workerQueue: make(chan func()),
+		taskQueue:   make(chan any),
+		workerQueue: make(chan poolTask),
 		stopSignal:  make(chan struct{}),
 		stoppedChan: make(chan struct{}),
 	}
@@ -48,16 +53,32 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 // goroutines processing requests does not exceed the specified maximum.
 type WorkerPool struct {
 	maxWorkers   int
-	taskQueue    chan func()
-	workerQueue  chan func()
+	taskQueue    chan any
+	workerQueue  chan poolTask
 	stoppedChan  chan struct{}
 	stopSignal   chan struct{}
-	waitingQueue deque.Deque[func()]
+	waitingQueue deque.Deque[poolTask]
 	stopLock     sync.Mutex
 	stopOnce     sync.Once
 	stopped      bool
 	waiting      atomic.Int32
 	wait         bool
+	tracker      taskTracker
+}
+
+// poolTask pairs a queued task with its assignment sequence number. Sequence
+// numbers are assigned by the dispatcher in the order it receives tasks. A
+// zero sequence marks an untracked task (worker kill signal or probes).
+type poolTask struct {
+	seq  uint64
+	task func()
+}
+
+// fenceMarker is intercepted by the dispatcher instead of being executed. It
+// registers a fence targeting the sequence watermark at the marker's position
+// in the task stream.
+type fenceMarker struct {
+	fence *Fence
 }
 
 // Size returns the maximum number of concurrent workers.
@@ -88,6 +109,31 @@ func (p *WorkerPool) Stopped() bool {
 	p.stopLock.Lock()
 	defer p.stopLock.Unlock()
 	return p.stopped
+}
+
+// Fence returns a Fence that is released once all tasks received by the
+// worker pool before the call to Fence have completed. Tasks submitted after
+// the call do not delay the fence.
+//
+// Fences may be created repeatedly while the pool is running, and multiple
+// fences may be waited on concurrently. Each fence only observes the state of
+// the task stream at its own sampling point, so a later task finishing first
+// never releases an older fence while an earlier task is still outstanding.
+//
+// If the pool is stopped with Stop, tasks still queued at that point are
+// discarded and any fence covering them resolves with ErrFenceDropped instead
+// of remaining blocked. Stopping with StopWait runs all queued tasks, so
+// fences then resolve with nil. Fence returns an already-dropped fence if the
+// pool is already stopped.
+func (p *WorkerPool) Fence() (fence *Fence) {
+	fence = &Fence{done: make(chan struct{})}
+	defer func() {
+		if recover() != nil {
+			fence.resolve(ErrFenceDropped)
+		}
+	}()
+	p.taskQueue <- fenceMarker{fence}
+	return fence
 }
 
 // Do enqueues a function for a worker to execute. Returns ErrStopped if the
@@ -148,6 +194,33 @@ func (p *WorkerPool) SubmitWait(task func()) {
 // WaitingQueueSize returns the count of tasks in the waiting queue.
 func (p *WorkerPool) WaitingQueueSize() int {
 	return int(p.waiting.Load())
+}
+
+// Fence tracks completion of the set of tasks received by a worker pool up to
+// a sampling point. A Fence is created with WorkerPool.Fence and is safe for
+// concurrent Waits; all waits return the same result.
+type Fence struct {
+	done   chan struct{}
+	err    error
+	target uint64
+}
+
+// Wait blocks until every task covered by the fence has completed, or until
+// ctx is canceled. It returns nil when the covered tasks all completed. It
+// returns ErrFenceDropped when the pool was stopped with Stop and a covered
+// task was discarded without running. It returns ctx.Err() if ctx is
+// canceled first; canceling ctx does not affect other waiters or the fence
+// itself.
+func (f *Fence) Wait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-f.done:
+		return f.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Pause causes all workers to wait on the given Context, thereby making them
@@ -212,22 +285,27 @@ Loop:
 		}
 
 		select {
-		case task, ok := <-p.taskQueue:
+		case item, ok := <-p.taskQueue:
 			if !ok {
 				break Loop
 			}
+			if marker, ok := item.(fenceMarker); ok {
+				p.tracker.register(marker.fence)
+				continue
+			}
 			// Got a task to do.
+			queued := poolTask{seq: p.tracker.accept(), task: item.(func())}
 			select {
-			case p.workerQueue <- task:
+			case p.workerQueue <- queued:
 			default:
 				// Create a new worker, if not at max.
 				if workerCount < p.maxWorkers {
 					wg.Add(1)
-					go worker(task, p.workerQueue, &wg)
+					go worker(queued, p.workerQueue, &p.tracker, &wg)
 					workerCount++
 				} else {
 					// Enqueue task to be executed by next available worker.
-					p.waitingQueue.PushBack(task)
+					p.waitingQueue.PushBack(queued)
 					p.waiting.Store(int32(p.waitingQueue.Len()))
 				}
 			}
@@ -252,16 +330,20 @@ Loop:
 
 	// Stop all remaining workers as they become ready.
 	for workerCount > 0 {
-		p.workerQueue <- nil
+		p.workerQueue <- poolTask{}
 		workerCount--
 	}
 	wg.Wait()
+	p.tracker.finish(p.wait)
 }
 
-// worker executes tasks and stops when it receives a nil task.
-func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
-	for task != nil {
-		task()
+// worker executes tasks and stops when it receives a zero-value poolTask.
+func worker(task poolTask, workerQueue chan poolTask, tracker *taskTracker, wg *sync.WaitGroup) {
+	for task.task != nil {
+		task.task()
+		if task.seq != 0 {
+			tracker.completed(task.seq)
+		}
 		task = <-workerQueue
 	}
 	wg.Done()
@@ -293,11 +375,18 @@ func (p *WorkerPool) stop(wait bool) {
 // worker pool is stopped.
 func (p *WorkerPool) processWaitingQueue() bool {
 	select {
-	case task, ok := <-p.taskQueue:
+	case item, ok := <-p.taskQueue:
 		if !ok {
 			return false
 		}
-		p.waitingQueue.PushBack(task)
+		if marker, ok := item.(fenceMarker); ok {
+			p.tracker.register(marker.fence)
+		} else {
+			p.waitingQueue.PushBack(poolTask{
+				seq:  p.tracker.accept(),
+				task: item.(func()),
+			})
+		}
 	case p.workerQueue <- p.waitingQueue.Front():
 		// A worker was ready, so gave task to worker.
 		p.waitingQueue.PopFront()
@@ -308,7 +397,7 @@ func (p *WorkerPool) processWaitingQueue() bool {
 
 func (p *WorkerPool) killIdleWorker() bool {
 	select {
-	case p.workerQueue <- nil:
+	case p.workerQueue <- poolTask{}:
 		// Sent kill signal to worker.
 		return true
 	default:
@@ -325,4 +414,111 @@ func (p *WorkerPool) runQueuedTasks() {
 		p.workerQueue <- p.waitingQueue.PopFront()
 		p.waiting.Store(int32(p.waitingQueue.Len()))
 	}
+}
+
+// taskTracker maintains the ordered completion watermark for dispatched
+// tasks. The dispatcher assigns sequence numbers and registers fences; worker
+// goroutines report completions concurrently.
+//
+// received is one past the sequence number of the last received task. done is
+// the prefix of tasks known to have completed. completedSeq holds only tasks
+// that finished out of order, i.e. sequences greater than done; it shrinks to
+// empty whenever the prefix is merged. Pending fences are kept in target order
+// until released, so neither structure retains the full task history.
+type taskTracker struct {
+	mu           sync.Mutex
+	received     uint64
+	done         uint64
+	completedSeq map[uint64]struct{}
+	fences       deque.Deque[*Fence]
+}
+
+// accept assigns the next sequence number to a task received by the
+// dispatcher.
+func (t *taskTracker) accept() uint64 {
+	t.received++
+	return t.received
+}
+
+// completed reports that the task with the given sequence number finished. It
+// merges the completed prefix and releases any fences whose targets are now
+// covered.
+func (t *taskTracker) completed(seq uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if seq <= t.done {
+		return
+	}
+	if t.completedSeq == nil {
+		t.completedSeq = make(map[uint64]struct{})
+	}
+	t.completedSeq[seq] = struct{}{}
+	for {
+		if _, ok := t.completedSeq[t.done+1]; !ok {
+			break
+		}
+		delete(t.completedSeq, t.done+1)
+		t.done++
+	}
+	t.resolveReady()
+}
+
+// register attaches a fence to the watermark at the current sampling point:
+// the fence covers exactly the tasks received so far. It is released at once
+// when all of those tasks have already completed.
+func (t *taskTracker) register(fence *Fence) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	fence.target = t.received
+	t.fences.PushBack(fence)
+	t.resolveReady()
+}
+
+// resolveReady releases, in target order, every pending fence whose covered
+// tasks have all completed. Caller must hold t.mu.
+func (t *taskTracker) resolveReady() {
+	for t.fences.Len() != 0 {
+		fence := t.fences.Front()
+		if fence.target > t.done {
+			break
+		}
+		t.fences.PopFront()
+		fence.resolve(nil)
+	}
+}
+
+// finish resolves all fences still pending when the dispatcher exits. When
+// drain is true (StopWait) every queued task has been executed, so all fences
+// complete successfully. When drain is false (Stop) queued tasks were
+// abandoned: fences whose target is within the completed prefix succeed, and
+// the first fence reaching a discarded task -- and every fence after it --
+// gets ErrFenceDropped.
+func (t *taskTracker) finish(drain bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if drain {
+		t.done = t.received
+		t.completedSeq = nil
+	}
+	dropped := false
+	for t.fences.Len() != 0 {
+		fence := t.fences.PopFront()
+		if !dropped && fence.target <= t.done {
+			fence.resolve(nil)
+		} else {
+			dropped = true
+			fence.resolve(ErrFenceDropped)
+		}
+	}
+	t.completedSeq = nil
+}
+
+// resolve marks the fence complete with the given result. Exactly one call to
+// resolve ever happens per fence.
+func (f *Fence) resolve(err error) {
+	f.err = err
+	close(f.done)
 }

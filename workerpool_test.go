@@ -629,6 +629,420 @@ func TestWorkerLeak(t *testing.T) {
 	})
 }
 
+func TestFence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(2)
+
+		block := make(chan struct{})
+		wp.Submit(func() { <-block }) // covered task, runs on worker 1
+
+		fence := wp.Fence()
+
+		// A task submitted after the fence runs to completion first on the
+		// other worker; it must not release the fence.
+		postDone := make(chan struct{})
+		wp.Submit(func() { close(postDone) })
+
+		fenceDone := make(chan error, 1)
+		go func() {
+			fenceDone <- fence.Wait(context.Background())
+		}()
+		synctest.Wait()
+
+		select {
+		case <-postDone:
+		case <-time.After(time.Second):
+			t.Fatal("post-fence task did not run")
+		}
+
+		select {
+		case <-fenceDone:
+			t.Fatal("fence released by a later task while a covered task was still running")
+		default:
+		}
+
+		close(block)
+
+		select {
+		case err := <-fenceDone:
+			if err != nil {
+				t.Fatal("fence returned error:", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("fence did not release")
+		}
+
+		// Repeated use: a fence on an idle pool resolves immediately.
+		fence = wp.Fence()
+		if err := fence.Wait(context.Background()); err != nil {
+			t.Fatal("idle fence returned error:", err)
+		}
+
+		wp.StopWait()
+	})
+}
+
+func TestFenceHole(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const workers = 2
+		wp := New(workers)
+
+		block1 := make(chan struct{})
+		block2 := make(chan struct{})
+		wp.Submit(func() { <-block1 }) // seq 1
+		wp.Submit(func() { <-block2 }) // seq 2
+		synctest.Wait()
+
+		fence := wp.Fence() // target 2
+
+		// Queue a third task and a second fence; this task must not let the
+		// first fence skip over the seq 1/seq 2 holes.
+		ran3 := make(chan struct{})
+		wp.Submit(func() { close(ran3) })
+		fence2 := wp.Fence() // target 3
+
+		fenceDone := make(chan error, 1)
+		go func() { fenceDone <- fence.Wait(context.Background()) }()
+		fence2Done := make(chan error, 1)
+		go func() { fence2Done <- fence2.Wait(context.Background()) }()
+		synctest.Wait()
+
+		// Finish seq 2 first; its worker then drains queued seq 3, but seq 1
+		// keeps the watermark at zero.
+		close(block2)
+		synctest.Wait()
+
+		select {
+		case <-fenceDone:
+			t.Fatal("old fence crossed the seq 1 hole")
+		default:
+		}
+
+		// seq 2 completed and its worker immediately ran queued seq 3, while
+		// seq 1 is still outstanding. Those are tracked as holes, not as full
+		// task history.
+		wp.tracker.mu.Lock()
+		if len(wp.tracker.completedSeq) != 2 {
+			t.Fatal("expected two unmerged holes, have", len(wp.tracker.completedSeq))
+		}
+		wp.tracker.mu.Unlock()
+
+		close(block1)
+
+		select {
+		case err := <-fenceDone:
+			if err != nil {
+				t.Fatal("fence error:", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("fence did not release after hole merged")
+		}
+
+		select {
+		case err := <-fence2Done:
+			if err != nil {
+				t.Fatal("fence2 error:", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("fence2 did not release after queued task ran")
+		}
+
+		select {
+		case <-ran3:
+		case <-time.After(time.Second):
+			t.Fatal("post-fence task did not run")
+		}
+
+		// After merging the prefix, no task history remains.
+		wp.tracker.mu.Lock()
+		if len(wp.tracker.completedSeq) != 0 {
+			t.Fatal("hole map should be empty after merge")
+		}
+		if wp.tracker.fences.Len() != 0 {
+			t.Fatal("fences should have been released")
+		}
+		wp.tracker.mu.Unlock()
+
+		wp.StopWait()
+	})
+}
+
+func TestFenceMultipleWaiters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const workers = 1
+		wp := New(workers)
+
+		release := make(chan struct{})
+		wp.Submit(func() { <-release })
+
+		fence1 := wp.Fence()
+		wp.Submit(func() { <-release })
+		fence2 := wp.Fence()
+
+		const waiters = 4
+		var wg sync.WaitGroup
+		wg.Add(waiters * 2)
+		results1 := make([]error, waiters)
+		results2 := make([]error, waiters)
+		for i := range waiters {
+			go func(i int) {
+				defer wg.Done()
+				results1[i] = fence1.Wait(context.Background())
+			}(i)
+			go func(i int) {
+				defer wg.Done()
+				results2[i] = fence2.Wait(context.Background())
+			}(i)
+		}
+		synctest.Wait()
+
+		close(release)
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("parallel fence waits did not all return")
+		}
+		for i := range waiters {
+			if results1[i] != nil || results2[i] != nil {
+				t.Fatal("fence wait returned error")
+			}
+		}
+
+		wp.StopWait()
+	})
+}
+
+func TestFenceCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1)
+
+		release := make(chan struct{})
+		wp.Submit(func() { <-release })
+		fence := wp.Fence()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		waitErr := make(chan error, 1)
+		go func() { waitErr <- fence.Wait(ctx) }()
+		synctest.Wait()
+
+		cancel()
+		select {
+		case err := <-waitErr:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatal("expected context.Canceled, got", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("canceled Wait did not return")
+		}
+
+		// Canceled context must not release the fence itself; another waiter with
+		// a live context still blocks until the covered task completes.
+		waitErr2 := make(chan error, 1)
+		go func() { waitErr2 <- fence.Wait(context.Background()) }()
+		synctest.Wait()
+		select {
+		case <-waitErr2:
+			t.Fatal("fence released by another waiter's canceled context")
+		default:
+		}
+
+		close(release)
+		select {
+		case err := <-waitErr2:
+			if err != nil {
+				t.Fatal("fence error after completion:", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("fence did not release after task completed")
+		}
+
+		wp.StopWait()
+	})
+}
+
+func TestFenceStopDropped(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const workers = 2
+		wp := New(workers)
+
+		release := make(chan struct{})
+		// Fill all workers and queue more tasks that will be discarded.
+		for range workers + 3 {
+			wp.Submit(func() { <-release })
+		}
+
+		fence := wp.Fence()
+
+		fenceDone := make(chan error, 1)
+		go func() { fenceDone <- fence.Wait(context.Background()) }()
+		synctest.Wait()
+
+		stopDone := make(chan struct{})
+		go func() {
+			wp.Stop()
+			close(stopDone)
+		}()
+		synctest.Wait()
+
+		select {
+		case <-fenceDone:
+			t.Fatal("fence should block while running tasks are still active")
+		default:
+		}
+
+		close(release)
+
+		select {
+		case err := <-fenceDone:
+			if !errors.Is(err, ErrFenceDropped) {
+				t.Fatal("expected ErrFenceDropped, got", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("discarded fence hung instead of resolving")
+		}
+
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("Stop did not return")
+		}
+
+		// A fence created after the pool stopped is already resolved.
+		fence = wp.Fence()
+		if err := fence.Wait(context.Background()); !errors.Is(err, ErrFenceDropped) {
+			t.Fatal("expected ErrFenceDropped after stop, got", err)
+		}
+	})
+}
+
+func TestFenceStopCompletedPrefix(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1)
+
+		ran := make(chan struct{})
+		close(ran)
+		wp.Submit(func() { <-ran }) // completes before stop
+
+		headDone := make(chan struct{})
+		wp.Submit(func() { <-headDone }) // running at stop
+		fenceEarly := wp.Fence()         // covers only the completed task
+
+		release := make(chan struct{})
+		wp.Submit(func() { <-release }) // queued, discarded
+		fenceLate := wp.Fence()
+
+		stopDone := make(chan struct{})
+		go func() {
+			wp.Stop()
+			close(stopDone)
+		}()
+		lateErr := make(chan error, 1)
+		go func() { lateErr <- fenceLate.Wait(context.Background()) }()
+		synctest.Wait()
+
+		// While tasks are still running neither fence resolves.
+		select {
+		case err := <-lateErr:
+			t.Fatal("fence resolved before running tasks finished, got", err)
+		default:
+		}
+
+		close(headDone)
+		close(release)
+
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("Stop did not return")
+		}
+
+		if err := fenceEarly.Wait(context.Background()); err != nil {
+			t.Fatal("fence over completed prefix should succeed, got", err)
+		}
+		select {
+		case err := <-lateErr:
+			if !errors.Is(err, ErrFenceDropped) {
+				t.Fatal("fence over discarded tasks should fail, got", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("late fence did not resolve after stop")
+		}
+	})
+}
+
+func TestFenceStopWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const workers = 2
+		wp := New(workers)
+
+		release := make(chan struct{})
+		for range workers + 5 {
+			wp.Submit(func() { <-release })
+		}
+
+		fence := wp.Fence()
+
+		go func() {
+			time.Sleep(time.Millisecond)
+			close(release)
+		}()
+		wp.StopWait()
+
+		if err := fence.Wait(context.Background()); err != nil {
+			t.Fatal("StopWait should drain all tasks and satisfy the fence, got", err)
+		}
+	})
+}
+
+func TestFenceMemoryBounded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const workers = 1
+		wp := New(workers)
+
+		// One hole: a long task blocks while many later tasks complete first.
+		block := make(chan struct{})
+		wp.Submit(func() { <-block })
+		const later = 100
+		for range later {
+			wp.Submit(func() {})
+		}
+		fence := wp.Fence()
+		synctest.Wait()
+
+		// Later tasks cannot run before the blocking one with one worker, so
+		// instead verify state while the head task blocks: nothing completed
+		// out of order and the full history is not retained.
+		wp.tracker.mu.Lock()
+		if len(wp.tracker.completedSeq) != 0 {
+			t.Fatal("no holes expected yet")
+		}
+		if wp.tracker.done != 0 {
+			t.Fatal("watermark should not advance past running head task")
+		}
+		wp.tracker.mu.Unlock()
+
+		close(block)
+		if err := fence.Wait(context.Background()); err != nil {
+			t.Fatal("fence error:", err)
+		}
+
+		wp.tracker.mu.Lock()
+		got := len(wp.tracker.completedSeq)
+		wp.tracker.mu.Unlock()
+		if got != 0 {
+			t.Fatal("expected completed-task history to be reclaimed, have", got)
+		}
+
+		wp.StopWait()
+	})
+}
+
 func TestPanicDo(t *testing.T) {
 	wp := New(1)
 	wp.Stop()
@@ -684,7 +1098,7 @@ func anyReady(w *WorkerPool) bool {
 		<-release
 	}
 	select {
-	case w.workerQueue <- wait:
+	case w.workerQueue <- poolTask{task: wait}:
 		close(release)
 		return true
 	default:
@@ -702,7 +1116,7 @@ func countReady(w *WorkerPool) int {
 	var readyCount int
 	for i := 0; i < max; i++ {
 		select {
-		case w.workerQueue <- wait:
+		case w.workerQueue <- poolTask{task: wait}:
 			readyCount++
 		case <-timeout:
 			i = max
