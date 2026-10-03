@@ -81,7 +81,8 @@ type Decoder struct {
 	r io.Reader
 
 	// global settings
-	strict bool
+	strict     bool
+	exceptions []Key
 
 	// toggles unmarshaler interface
 	unmarshalerInterface bool
@@ -101,6 +102,22 @@ func NewDecoder(r io.Reader) *Decoder {
 // description of the missing fields.
 func (d *Decoder) DisallowUnknownFields() *Decoder {
 	d.strict = true
+	d.exceptions = nil
+	return d
+}
+
+// DisallowUnknownFieldsExcept behaves like DisallowUnknownFields, but allows
+// unknown keys located below one of the given structured key paths. Paths are
+// matched by decoded key parts, so Key{"plugins", "extra"} matches the
+// plugins.extra subtree and is distinct from the single quoted key
+// "plugins.extra". A path also matches every element of an array table at
+// that location.
+func (d *Decoder) DisallowUnknownFieldsExcept(paths ...[]string) *Decoder {
+	d.strict = true
+	d.exceptions = d.exceptions[:0]
+	for _, path := range paths {
+		d.exceptions = append(d.exceptions, path)
+	}
 	return d
 }
 
@@ -175,6 +192,7 @@ func (d *Decoder) Decode(v interface{}) error {
 	}
 
 	dec := getDecoder(d.strict, d.unmarshalerInterface)
+	dec.strict.exceptions = append(dec.strict.exceptions[:0], d.exceptions...)
 	err = dec.unmarshal(b, v)
 	putDecoder(dec)
 	return err

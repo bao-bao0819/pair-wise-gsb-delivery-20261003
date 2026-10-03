@@ -2817,6 +2817,121 @@ bar = 42`,
 	}
 }
 
+func TestDecoderStrictExceptions(t *testing.T) {
+	type plugin struct {
+		Name string
+	}
+	type plugins struct {
+		Items []plugin
+	}
+	type config struct {
+		Plugins plugins
+	}
+
+	input := `
+naem = "root typo"
+"plugins.extra" = true
+
+[plugins.extra]
+external = true
+
+[plugins.extra.nested]
+external = true
+
+[plugins.extras]
+external = true
+
+[pluginx.extra]
+external = true
+
+[[plugins.items]]
+name = "first"
+enabled = true
+
+[plugins.items.options]
+external = true
+
+[[plugins.items]]
+name = "second"
+enabled = false
+
+[plugins.items.options]
+external = false
+`
+
+	t.Run("structured paths exempt subtrees and array elements", func(t *testing.T) {
+		var cfg config
+		decoder := toml.NewDecoder(strings.NewReader(input)).
+			DisallowUnknownFieldsExcept(
+				toml.Key{"plugins", "extra"},
+				toml.Key{"plugins", "items"},
+			)
+
+		err := decoder.Decode(&cfg)
+
+		var strictErr *toml.StrictMissingError
+		if !errors.As(err, &strictErr) {
+			t.Fatalf("expected *toml.StrictMissingError, got %v (%T)", err, err)
+		}
+
+		keys := make([]toml.Key, len(strictErr.Errors))
+		for i, decodeErr := range strictErr.Errors {
+			keys[i] = decodeErr.Key()
+		}
+		assert.Equal(t, []toml.Key{
+			{"naem"},
+			{"plugins.extra"},
+			{"plugins", "extras"},
+			{"pluginx", "extra"},
+		}, keys)
+		assert.Equal(t, 2, len(cfg.Plugins.Items))
+		assert.Equal(t, "first", cfg.Plugins.Items[0].Name)
+		assert.Equal(t, "second", cfg.Plugins.Items[1].Name)
+	})
+
+	t.Run("default strict mode has no exceptions", func(t *testing.T) {
+		var cfg config
+		err := toml.NewDecoder(strings.NewReader(input)).
+			DisallowUnknownFields().
+			Decode(&cfg)
+		assert.Error(t, err)
+
+		var strictErr *toml.StrictMissingError
+		if errors.As(err, &strictErr) {
+			assert.True(t, len(strictErr.Errors) > 3, "expected unexempted strict errors")
+		}
+	})
+
+	t.Run("exceptions do not allow malformed TOML", func(t *testing.T) {
+		var cfg config
+		err := toml.NewDecoder(strings.NewReader("[plugins.extra\n")).
+			DisallowUnknownFieldsExcept(toml.Key{"plugins", "extra"}).
+			Decode(&cfg)
+		assert.Error(t, err)
+
+		var strictErr *toml.StrictMissingError
+		assert.False(t, errors.As(err, &strictErr))
+	})
+
+	t.Run("exceptions do not allow duplicate declarations", func(t *testing.T) {
+		duplicate := `
+[plugins.extra]
+external = true
+
+[plugins.extra]
+external = false
+`
+		var cfg config
+		err := toml.NewDecoder(strings.NewReader(duplicate)).
+			DisallowUnknownFieldsExcept(toml.Key{"plugins", "extra"}).
+			Decode(&cfg)
+		assert.Error(t, err)
+
+		var strictErr *toml.StrictMissingError
+		assert.False(t, errors.As(err, &strictErr))
+	})
+}
+
 func TestIssue252(t *testing.T) {
 	type config struct {
 		Val1 string `toml:"val1"`

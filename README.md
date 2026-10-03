@@ -44,6 +44,10 @@ operations should not be shockingly slow. See [benchmarks](#benchmarks).
 the TOML document was not present in the target structure. This is a great way
 to check for typos. [See example in the documentation][strict].
 
+`DisallowUnknownFieldsExcept` enables the same strict checks while exempting
+structured key paths. Each path is a sequence of decoded key parts, and an
+array-table path applies to every element in that array.
+
 [strict]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#example-Decoder.DisallowUnknownFields
 
 ### Contextualized errors

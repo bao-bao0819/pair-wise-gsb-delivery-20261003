@@ -6,7 +6,8 @@ import (
 )
 
 type strict struct {
-	Enabled bool
+	Enabled    bool
+	exceptions []Key
 
 	// Tracks the current key being processed.
 	key tracker.KeyTracker
@@ -44,6 +45,9 @@ func (s *strict) MissingTable(node *unstable.Node) {
 	if !s.Enabled {
 		return
 	}
+	if s.exempt(s.key.Key()) {
+		return
+	}
 	s.missing = append(s.missing, decodeError{
 		highlight: keyLocation(node),
 		key:       s.key.Key(),
@@ -58,12 +62,38 @@ func (s *strict) MissingField(node *unstable.Node) {
 		return
 	}
 	s.key.Push(node)
+	key := s.key.Key()
+	if s.exempt(key) {
+		s.key.Pop(node)
+		return
+	}
 	s.missing = append(s.missing, decodeError{
 		highlight: keyLocation(node),
-		key:       s.key.Key(),
+		key:       key,
 		message:   "unknown field",
 	})
 	s.key.Pop(node)
+}
+
+func (s *strict) exempt(key Key) bool {
+	for _, exception := range s.exceptions {
+		if hasKeyPrefix(key, exception) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasKeyPrefix(key, prefix Key) bool {
+	if len(prefix) == 0 || len(key) < len(prefix) {
+		return false
+	}
+	for i, part := range prefix {
+		if key[i] != part {
+			return false
+		}
+	}
+	return true
 }
 
 // Error returns the cumulated StrictMissingError for the document, or nil.
