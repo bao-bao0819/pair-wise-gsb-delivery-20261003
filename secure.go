@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/unrolled/secure/permissionspolicybuilder"
 )
 
 type secureCtxKey string
@@ -91,6 +93,10 @@ type Options struct {
 	FeaturePolicy string
 	// PermissionsPolicy allows to selectively enable and disable use of various browser features and APIs. Default is "".
 	PermissionsPolicy string
+	// PermissionsPolicyBuilder allows to selectively enable and disable use of various browser features and APIs
+	// using a typed builder. It is serialized to the Permissions-Policy header at construction time.
+	// Setting both PermissionsPolicy and PermissionsPolicyBuilder is a configuration conflict and panics.
+	PermissionsPolicyBuilder *permissionspolicybuilder.Builder
 	// CrossOriginOpenerPolicy allows you to ensure a top-level document does not share a browsing context group with cross-origin documents. Default is "".
 	// Reference: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cross-Origin-Opener-Policy
 	CrossOriginOpenerPolicy string
@@ -160,6 +166,14 @@ func New(options ...Options) *Secure {
 	o.ContentSecurityPolicyReportOnly = strings.ReplaceAll(o.ContentSecurityPolicyReportOnly, "$NONCE", "'nonce-%[1]s'")
 
 	o.nonceEnabled = strings.Contains(o.ContentSecurityPolicy, "%[1]s") || strings.Contains(o.ContentSecurityPolicyReportOnly, "%[1]s")
+
+	if o.PermissionsPolicy != "" && o.PermissionsPolicyBuilder != nil {
+		panic("secure: both PermissionsPolicy and PermissionsPolicyBuilder are set; configure only one")
+	}
+
+	if o.PermissionsPolicyBuilder != nil {
+		o.PermissionsPolicy = o.PermissionsPolicyBuilder.MustBuild()
+	}
 
 	s := &Secure{
 		opt:               o,

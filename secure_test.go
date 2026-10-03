@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/unrolled/secure/permissionspolicybuilder"
 )
 
 const (
@@ -1043,6 +1045,93 @@ func TestPermissionsPolicy(t *testing.T) {
 
 	expect(t, res.Code, http.StatusOK)
 	expect(t, res.Header().Get("Permissions-Policy"), "geolocation=(self)")
+}
+
+func TestPermissionsPolicyBuilder_EmptyAllowList(t *testing.T) {
+	b := &permissionspolicybuilder.Builder{}
+	expect(t, b.BlockFeature("geolocation"), nil)
+
+	s := New(Options{PermissionsPolicyBuilder: b})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+	expect(t, res.Header().Get("Permissions-Policy"), "geolocation=()")
+	expect(t, len(res.Header().Values("Permissions-Policy")), 1)
+}
+
+func TestPermissionsPolicyBuilder_MultipleFeaturesAndOrigins(t *testing.T) {
+	b := &permissionspolicybuilder.Builder{}
+	expect(t, b.AllowFeature("camera"), nil)
+	expect(t, b.AllowSelf("fullscreen"), nil)
+	expect(t, b.AllowOrigins("geolocation", "https://example.com", "https://docs.example.com"), nil)
+
+	s := New(Options{PermissionsPolicyBuilder: b})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+	expect(
+		t,
+		res.Header().Get("Permissions-Policy"),
+		`camera=*, fullscreen=(self), geolocation=(self "https://example.com" "https://docs.example.com")`,
+	)
+	expect(t, len(res.Header().Values("Permissions-Policy")), 1)
+}
+
+func TestPermissionsPolicyBuilderInvalidPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("The code did not panic")
+		}
+	}()
+
+	b := &permissionspolicybuilder.Builder{}
+	b.Features = map[string]permissionspolicybuilder.AllowList{
+		"camera": {Self: true, Origins: []string{"https://example.com/path"}},
+	}
+	New(Options{PermissionsPolicyBuilder: b})
+}
+
+func TestPermissionsPolicyConflictPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("The code did not panic")
+		}
+	}()
+
+	b := &permissionspolicybuilder.Builder{}
+	expect(t, b.BlockFeature("camera"), nil)
+	New(Options{
+		PermissionsPolicy:        "camera=()",
+		PermissionsPolicyBuilder: b,
+	})
+}
+
+func TestPermissionsPolicyBuilderNestedMiddleware(t *testing.T) {
+	innerBuilder := &permissionspolicybuilder.Builder{}
+	expect(t, innerBuilder.AllowOrigins("geolocation", "https://inner.example.com"), nil)
+	innerMiddleware := New(Options{PermissionsPolicyBuilder: innerBuilder})
+
+	outerBuilder := &permissionspolicybuilder.Builder{}
+	expect(t, outerBuilder.AllowOrigins("camera", "https://outer.example.com"), nil)
+	outerMiddleware := New(Options{PermissionsPolicyBuilder: outerBuilder})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+
+	outerMiddleware.Handler(innerMiddleware.Handler(myHandler)).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+	// Header.Set replaces rather than appends, so a single policy survives.
+	expect(t, len(res.Header().Values("Permissions-Policy")), 1)
+	expect(t, res.Header().Get("Permissions-Policy"), `geolocation=(self "https://inner.example.com")`)
 }
 
 func TestCrossOriginOpenerPolicy(t *testing.T) {
