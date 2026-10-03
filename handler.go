@@ -3,6 +3,7 @@
 package nosurf
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"net/url"
@@ -47,6 +48,11 @@ type CSRFHandler struct {
 	// This should be a better solution of customizing the options
 	// than a bunch of methods SetCookieExpiration(), etc.
 	baseCookie http.Cookie
+
+	// Read-only legacy cookie names accepted during a limited
+	// migration period, along with the Path/Domain/etc. to use
+	// when issuing their deletion cookies.
+	legacyCookies []http.Cookie
 
 	// Slices of paths that are exempt from CSRF checks.
 	// All of those will be matched against Request.URL.Path,
@@ -125,12 +131,7 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer ctxClear(r)
 	w.Header().Add("Vary", "Cookie")
 
-	var realToken []byte
-
-	tokenCookie, err := r.Cookie(h.getCookieName())
-	if err == nil {
-		realToken = b64decode(tokenCookie.Value)
-	}
+	realToken := h.resolveToken(w, r)
 
 	// If the length of the real token isn't what it should be,
 	// it has either been tampered with,
@@ -169,6 +170,129 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Everything else passed, handle the success.
 	h.handleSuccess(w, r)
+}
+
+// resolveToken determines the real (unmasked) CSRF token for the request.
+//
+// The rules are:
+//
+//   - If the primary cookie name is present, it always wins and legacy
+//     names are ignored entirely, even if the primary value is corrupt.
+//   - Duplicate cookies with the primary name must agree on the value;
+//     conflicting duplicates are rejected (nil is returned).
+//   - Only if the primary name is absent do legacy names participate.
+func (h *CSRFHandler) resolveToken(w http.ResponseWriter, r *http.Request) []byte {
+	primary := cookiesNamed(r, h.getCookieName())
+	if len(primary) > 0 {
+		if len(primary) > 1 && !sameCookieValues(primary) {
+			// Conflicting duplicate cookies: refuse to pick one.
+			return nil
+		}
+		return b64decode(primary[0].Value)
+	}
+
+	return h.legacyToken(w, r)
+}
+
+// legacyToken resolves the token from read-only legacy cookie names.
+// It is only consulted when the primary cookie name is absent.
+//
+// The rules are:
+//
+//   - All valid legacy cookies in the request must decode to the same
+//     token. If multiple contradictory tokens are present, none of them
+//     is trusted: the request fails and the legacy cookies are deleted.
+//   - Corrupt legacy cookies never participate in validation, but are
+//     still scheduled for deletion.
+//   - On a single consistent token, the token is migrated: it is
+//     re-issued under the primary name and every legacy cookie present
+//     in the request is deleted.
+func (h *CSRFHandler) legacyToken(w http.ResponseWriter, r *http.Request) []byte {
+	if len(h.legacyCookies) == 0 {
+		return nil
+	}
+
+	var token []byte
+	conflict := false
+	present := make(map[string]bool)
+
+	for _, base := range h.legacyCookies {
+		if base.Name == "" || base.Name == h.getCookieName() {
+			continue
+		}
+		for _, c := range cookiesNamed(r, base.Name) {
+			present[base.Name] = true
+			decoded := b64decode(c.Value)
+			if len(decoded) != tokenLength {
+				// Corrupt legacy cookie: doesn't participate in
+				// validation, but still gets cleaned up.
+				continue
+			}
+			if token == nil {
+				token = decoded
+			} else if !bytes.Equal(token, decoded) {
+				conflict = true
+			}
+		}
+	}
+
+	if len(present) == 0 {
+		return nil
+	}
+
+	if conflict || token == nil {
+		// Contradictory (or only corrupt) legacy cookies: don't let
+		// the request pass on any of them. Clean them up so that the
+		// regenerated primary cookie is the only one left.
+		h.deleteLegacyCookies(w, present)
+		return nil
+	}
+
+	// A single, consistent token: migrate it to the primary name
+	// and delete the legacy cookies it came from.
+	h.setTokenCookie(w, r, token)
+	h.deleteLegacyCookies(w, present)
+
+	return token
+}
+
+// deleteLegacyCookies issues deletion cookies for every legacy name
+// present in the request. Each deletion cookie reuses the Path, Domain
+// and other attributes configured for that legacy name, so that the
+// cookie in the matching scope is the one that gets deleted.
+func (h *CSRFHandler) deleteLegacyCookies(w http.ResponseWriter, present map[string]bool) {
+	for _, base := range h.legacyCookies {
+		if !present[base.Name] {
+			continue
+		}
+		del := base
+		del.Value = ""
+		del.MaxAge = -1
+		http.SetCookie(w, &del)
+	}
+}
+
+// cookiesNamed returns every cookie in the request with the given name,
+// including duplicates.
+func cookiesNamed(r *http.Request, name string) []*http.Cookie {
+	var out []*http.Cookie
+	for _, c := range r.Cookies() {
+		if c.Name == name {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// sameCookieValues reports whether all the given cookies
+// carry the same value.
+func sameCookieValues(cookies []*http.Cookie) bool {
+	for _, c := range cookies[1:] {
+		if c.Value != cookies[0].Value {
+			return false
+		}
+	}
+	return true
 }
 
 // handleSuccess simply calls the successHandler.
@@ -283,6 +407,34 @@ func (h *CSRFHandler) SetFailureHandler(handler http.Handler) {
 // This way you can specify the Domain, Path, HttpOnly, Secure, etc.
 func (h *CSRFHandler) SetBaseCookie(cookie http.Cookie) {
 	h.baseCookie = cookie
+}
+
+// SetLegacyCookies registers legacy CSRF cookie names that are accepted,
+// read-only, during a limited migration period towards the current
+// (primary) cookie name.
+//
+// While at least one legacy cookie is registered:
+//
+//   - Responses only ever write the primary cookie name.
+//   - A request without a primary cookie is validated against the legacy
+//     names. On success, the token is migrated: it is re-issued under the
+//     primary name and the legacy cookies present in the request are
+//     deleted. Each deletion cookie reuses the Path, Domain and other
+//     attributes of the corresponding entry passed here, so configure
+//     them to match the scope the legacy cookies were originally set in.
+//   - If a request carries contradictory cookies (multiple legacy names,
+//     or duplicates of one name, holding different valid tokens), none of
+//     them is trusted: the check fails and the legacy cookies are deleted.
+//   - If the primary cookie is present, legacy cookies are ignored
+//     entirely, even when the primary value is corrupt.
+//
+// The Value and MaxAge of the given cookies are ignored; only the Name
+// and the scoping attributes (Path, Domain, etc.) are used.
+//
+// To end the migration period, call SetLegacyCookies() with no arguments:
+// legacy names then immediately stop participating in validation.
+func (h *CSRFHandler) SetLegacyCookies(cookies ...http.Cookie) {
+	h.legacyCookies = cookies
 }
 
 // SetIsTLSFunc sets a delegate function which determines, on a per-request basis, whether the request is made over a secure connection.
