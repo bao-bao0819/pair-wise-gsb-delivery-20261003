@@ -38,6 +38,11 @@ the dispatcher. This is done until there are no more workers to remove. The
 minimum number of workers is always zero, because the time to start new workers
 is insignificant.
 
+The maximum number of workers can be changed at any time using SetSize.
+Increasing the size starts new workers to handle already-waiting tasks, and
+decreasing the size retires workers at task boundaries, as they finish their
+current tasks, without interrupting them.
+
 Usage note
 
 It is advisable to use different worker pools for tasks that are bound by
