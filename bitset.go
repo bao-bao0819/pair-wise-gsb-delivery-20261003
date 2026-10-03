@@ -1620,6 +1620,111 @@ func (b *BitSet) ShiftRight(bits uint) {
 	}
 }
 
+// RotateLeft cyclically rotates the bits in [start, end) left by shift positions.
+// Bits moved beyond end reappear at start, and bits outside the range are unchanged.
+// The shift is reduced modulo the range width. It panics if start > end or end
+// exceeds the BitSet length.
+func (b *BitSet) RotateLeft(start, end, shift uint) *BitSet {
+	panicIfNull(b)
+	if start > end || end > b.length {
+		panic(Error("invalid range"))
+	}
+
+	width := end - start
+	if width <= 1 {
+		return b
+	}
+
+	shift %= width
+	if shift == 0 {
+		return b
+	}
+
+	b.reverseBitsInRange(start, end)
+	b.reverseBitsInRange(start, start+shift)
+	b.reverseBitsInRange(start+shift, end)
+
+	return b
+}
+
+// RotateRight cyclically rotates the bits in [start, end) right by shift positions.
+// Bits moved before start reappear at end-1, and bits outside the range are
+// unchanged. The shift is reduced modulo the range width. It panics if start >
+// end or end exceeds the BitSet length.
+func (b *BitSet) RotateRight(start, end, shift uint) *BitSet {
+	panicIfNull(b)
+	if start > end || end > b.length {
+		panic(Error("invalid range"))
+	}
+
+	width := end - start
+	if width <= 1 {
+		return b
+	}
+
+	shift %= width
+	if shift == 0 {
+		return b
+	}
+
+	return b.RotateLeft(start, end, width-shift)
+}
+
+func (b *BitSet) reverseBitsInRange(start, end uint) {
+	left, right := start, end
+
+	for left < right {
+		remaining := right - left
+		if remaining == 1 {
+			return
+		}
+
+		leftCapacity := wordSize - (left & wordMask)
+		rightCapacity := ((right - 1) & wordMask) + 1
+
+		chunkSize := remaining / 2
+		if leftCapacity < chunkSize {
+			chunkSize = leftCapacity
+		}
+		if rightCapacity < chunkSize {
+			chunkSize = rightCapacity
+		}
+
+		b.swapReversedBitChunks(left, right-chunkSize, chunkSize)
+		left += chunkSize
+		right -= chunkSize
+	}
+}
+
+func (b *BitSet) swapReversedBitChunks(left, right, size uint) {
+	leftWordIndex := left >> log2WordSize
+	rightWordIndex := right >> log2WordSize
+	leftOffset := left & wordMask
+	rightOffset := right & wordMask
+
+	mask := allBits >> (wordSize - size)
+	leftMask := mask << leftOffset
+	rightMask := mask << rightOffset
+
+	leftWord := b.set[leftWordIndex]
+	rightWord := b.set[rightWordIndex]
+
+	leftChunk := (leftWord & leftMask) >> leftOffset
+	rightChunk := (rightWord & rightMask) >> rightOffset
+	reversedLeftChunk := bits.Reverse64(leftChunk) >> (wordSize - size)
+	reversedRightChunk := bits.Reverse64(rightChunk) >> (wordSize - size)
+
+	if leftWordIndex == rightWordIndex {
+		b.set[leftWordIndex] = leftWord&^(leftMask|rightMask) |
+			reversedRightChunk<<leftOffset |
+			reversedLeftChunk<<rightOffset
+		return
+	}
+
+	b.set[leftWordIndex] = leftWord&^leftMask | reversedRightChunk<<leftOffset
+	b.set[rightWordIndex] = rightWord&^rightMask | reversedLeftChunk<<rightOffset
+}
+
 // OnesBetween returns the number of set bits in the range [from, to).
 // The range is inclusive of 'from' and exclusive of 'to'.
 // Returns 0 if from >= to.
