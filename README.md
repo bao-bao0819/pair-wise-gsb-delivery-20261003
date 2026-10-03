@@ -129,6 +129,42 @@ implements many standard library interfaces, including:
 * `encoding.TextMarshal` and `encoding.TextUnmarshal`
   (`encoding/json` friendly!)
 
+## Querying KSUIDs by Time
+
+KSUID only stores a whole UTC second; its random payload does not preserve
+the original nanosecond. Use `TimeBounds` to construct bounds for IDs whose
+encoded second belongs to a time interval. The lower bound includes the
+minimum payload, and the upper bound is exclusive. When the range reaches
+the maximum encodable second, `HasUpper` is false instead of constructing a
+wrapped or otherwise invalid KSUID.
+
+```go
+// start and end may use any time zone. The two booleans select whether each
+// endpoint is inclusive. This example is the half-open interval [start, end).
+bounds := ksuid.TimeBounds(start, end, true, false)
+
+query := "SELECT id FROM events"
+var args []interface{}
+
+if !bounds.NonEmpty {
+	query += " WHERE 1 = 0"
+} else {
+	query += " WHERE id >= ?"
+	args = append(args, bounds.Lower.String())
+
+	if bounds.HasUpper {
+		query += " AND id < ?"
+		args = append(args, bounds.Upper.String())
+	}
+}
+
+rows, err := db.Query(query, args...)
+```
+
+Use `bounds.Lower.Bytes()` and `bounds.Upper.Bytes()` for binary KSUID
+columns. Do not use two randomly generated IDs as bounds: either random
+payload can exclude IDs generated in the same second.
+
 ## Command Line Tool
 
 This package comes with a command-line tool `ksuid`, useful for
