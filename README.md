@@ -89,9 +89,27 @@ s := secure.New(secure.Options{
     XDNSPrefetchControl: "on", // XDNSPrefetchControl allows the X-DNS-Prefetch-Control header to be set via "on" or "off" keyword. Default is "".
     XPermittedCrossDomainPolicies: "none", // XPermittedCrossDomainPolicies allows the X-Permitted-Cross-Domain-Policies to be set with a custom value. Default is "".
     IsDevelopment: true, // This will cause the AllowedHosts, SSLRedirect, and STSSeconds/STSIncludeSubdomains options to be ignored during development. When deploying to production, be sure to set this to false.
+    HeadersCommitMode: true, // HeadersCommitMode defers applying the security headers until the downstream handler commits the final response headers. Default is false.
+    HeaderConflictPolicies: map[string]secure.HeaderConflictPolicy{"X-Frame-Options": secure.HeaderConflictKeep}, // HeaderConflictPolicies maps header names to the policy used to resolve conflicts with downstream handler values when HeadersCommitMode is enabled. Default is an empty map.
+    DefaultHeaderConflictPolicy: secure.HeaderConflictOverride, // DefaultHeaderConflictPolicy is the conflict policy used for headers not listed in HeaderConflictPolicies. Default is HeaderConflictOverride.
+    HeaderConflictHandler: nil, // HeaderConflictHandler is called at commit time for each header configured with the HeaderConflictError policy whose downstream value differs from the middleware value. Default is nil.
 })
 // ...
 ~~~
+
+### Headers commit mode
+By default the security headers are written to the response before the downstream handler runs, so a handler that
+modifies those headers can silently change the effective policy. When `HeadersCommitMode` is enabled, the headers are
+instead applied right before the final response headers are committed (the first non-1xx `WriteHeader`, the implicit
+200 triggered by `Write` or `Flush`, or the end of the handler), resolving any downstream modifications according to
+the configured conflict policies:
+
+- `HeaderConflictOverride` (default): the middleware value replaces the downstream value.
+- `HeaderConflictKeep`: a downstream value, if set, is preserved.
+- `HeaderConflictError`: the downstream value is preserved and the conflict is reported through `HeaderConflictHandler`.
+
+The wrapping `ResponseWriter` only exposes the `http.Flusher` and `http.Hijacker` capabilities that the underlying
+writer actually supports.
 
 ### Default options
 These are the preset options for Secure:

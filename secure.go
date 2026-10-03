@@ -125,6 +125,21 @@ type Options struct {
 	STSSeconds int64
 	// SecureContextKey allows a custom key to be specified for context storage.
 	SecureContextKey string
+	// HeadersCommitMode defers applying the security headers until the downstream handler commits the final response
+	// headers (the first non-1xx WriteHeader, the implicit 200 triggered by Write or Flush, or the end of the handler).
+	// This guarantees the configured header policy is enforced even when downstream handlers modify the headers.
+	// Default is false, which applies the headers before the downstream handler runs.
+	HeadersCommitMode bool
+	// HeaderConflictPolicies maps header names to the HeaderConflictPolicy used to resolve conflicts between
+	// middleware-computed values and downstream handler values when HeadersCommitMode is enabled. Header names are
+	// canonicalized. Headers not present in the map use DefaultHeaderConflictPolicy. Default is an empty map.
+	HeaderConflictPolicies map[string]HeaderConflictPolicy
+	// DefaultHeaderConflictPolicy is the conflict policy used for headers not listed in HeaderConflictPolicies.
+	// Default is HeaderConflictOverride.
+	DefaultHeaderConflictPolicy HeaderConflictPolicy
+	// HeaderConflictHandler is called at commit time for each header configured with the HeaderConflictError policy
+	// whose downstream value differs from the middleware-computed value. Default is nil.
+	HeaderConflictHandler HeaderConflictHandler `json:"-" toml:"-" yaml:"-"`
 }
 
 // Secure is a middleware that helps setup a few basic security features. A single secure.Options struct can be
@@ -184,6 +199,15 @@ func New(options ...Options) *Secure {
 		s.ctxSecureHeaderKey = secureCtxKey(s.opt.SecureContextKey)
 	}
 
+	if len(s.opt.HeaderConflictPolicies) > 0 {
+		canonical := make(map[string]HeaderConflictPolicy, len(s.opt.HeaderConflictPolicies))
+		for name, policy := range s.opt.HeaderConflictPolicies {
+			canonical[http.CanonicalHeaderKey(name)] = policy
+		}
+
+		s.opt.HeaderConflictPolicies = canonical
+	}
+
 	return s
 }
 
@@ -200,6 +224,12 @@ func (s *Secure) SetBadRequestHandler(handler http.Handler) {
 // Handler implements the http.HandlerFunc for integration with the standard net/http lib.
 func (s *Secure) Handler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.opt.HeadersCommitMode {
+			s.serveHTTPWithCommit(w, r, h)
+
+			return
+		}
+
 		// Let secure process the request. If it returns an error,
 		// that indicates the request should not continue.
 		responseHeader, r, err := s.processRequest(w, r)
@@ -212,6 +242,27 @@ func (s *Secure) Handler(h http.Handler) http.Handler {
 
 		h.ServeHTTP(w, r)
 	})
+}
+
+// serveHTTPWithCommit processes the request and defers applying the security
+// headers until the downstream handler commits the final response headers.
+func (s *Secure) serveHTTPWithCommit(w http.ResponseWriter, r *http.Request, h http.Handler) {
+	cw, wrapped := newCommitResponseWriter(w, r, s)
+
+	// Let secure process the request. If it returns an error,
+	// that indicates the request should not continue.
+	responseHeader, r, err := s.processRequest(wrapped, r)
+	cw.setResponseHeaders(responseHeader)
+
+	// If there was an error, do not continue.
+	if err != nil {
+		cw.finalize()
+
+		return
+	}
+
+	h.ServeHTTP(wrapped, r)
+	cw.finalize()
 }
 
 // HandlerForRequestOnly implements the http.HandlerFunc for integration with the standard net/http lib.
@@ -235,6 +286,24 @@ func (s *Secure) HandlerForRequestOnly(h http.Handler) http.Handler {
 
 // HandlerFuncWithNext is a special implementation for Negroni, but could be used elsewhere.
 func (s *Secure) HandlerFuncWithNext(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
+	if s.opt.HeadersCommitMode {
+		cw, wrapped := newCommitResponseWriter(w, r, s)
+
+		// Let secure process the request. If it returns an error,
+		// that indicates the request should not continue.
+		responseHeader, r, err := s.processRequest(wrapped, r)
+		cw.setResponseHeaders(responseHeader)
+
+		// If there was an error, do not call next.
+		if err == nil && next != nil {
+			next(wrapped, r)
+		}
+
+		cw.finalize()
+
+		return
+	}
+
 	// Let secure process the request. If it returns an error,
 	// that indicates the request should not continue.
 	responseHeader, r, err := s.processRequest(w, r)
