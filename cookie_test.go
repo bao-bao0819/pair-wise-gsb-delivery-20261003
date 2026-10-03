@@ -328,6 +328,147 @@ func TestScanCookie(t *testing.T) {
 	}
 }
 
+var cookieItemCases = []struct {
+	label  string
+	in     []byte
+	status CookieScanStatus
+	items  []CookieItem
+	brk    bool
+
+	c CookieScanner
+}{
+	{
+		label:  "dropped invalid name",
+		in:     []byte(`foo@example.com=1; bar=baz`),
+		status: CookieScanOK,
+		items: []CookieItem{
+			{Offset: 0, Raw: []byte(`foo@example.com=1`), Err: ErrCookieInvalidName},
+			{Offset: 19, Raw: []byte(`bar=baz`), Name: []byte(`bar`), Value: []byte(`baz`)},
+		},
+	},
+	{
+		label:  "dropped unclosed quote",
+		in:     []byte(`foo="bar; baz=1`),
+		status: CookieScanOK,
+		items: []CookieItem{
+			{Offset: 0, Raw: []byte(`foo="bar`), Err: ErrCookieUnclosedQuote},
+			{Offset: 10, Raw: []byte(`baz=1`), Name: []byte(`baz`), Value: []byte(`1`)},
+		},
+	},
+	{
+		label:  "dropped invalid value",
+		in:     []byte(`foo=bar"; ok=1`),
+		status: CookieScanOK,
+		items: []CookieItem{
+			{Offset: 0, Raw: []byte(`foo=bar"`), Err: ErrCookieInvalidValue},
+			{Offset: 10, Raw: []byte(`ok=1`), Name: []byte(`ok`), Value: []byte(`1`)},
+		},
+	},
+	{
+		label:  "equals inside dropped pair",
+		in:     []byte(`bad name=x=y; good=1`),
+		status: CookieScanOK,
+		items: []CookieItem{
+			{Offset: 0, Raw: []byte(`bad name=x=y`), Err: ErrCookieInvalidName},
+			{Offset: 14, Raw: []byte(`good=1`), Name: []byte(`good`), Value: []byte(`1`)},
+		},
+	},
+	{
+		label:  "break on pair error",
+		in:     []byte(`foo="1; bar=baz`),
+		status: CookieScanError,
+		items: []CookieItem{
+			{Offset: 0, Raw: []byte(`foo="1`), Err: ErrCookieUnclosedQuote},
+		},
+		c: CookieScanner{
+			BreakOnPairError: true,
+		},
+	},
+	{
+		label:  "strict missing value",
+		in:     []byte(`foo; bar=baz`),
+		status: CookieScanOK,
+		items: []CookieItem{
+			{Offset: 0, Raw: []byte(`foo`), Err: ErrCookieNoValue},
+			{Offset: 5, Raw: []byte(`bar=baz`), Name: []byte(`bar`), Value: []byte(`baz`)},
+		},
+		c: CookieScanner{
+			Strict: true,
+		},
+	},
+	{
+		label:  "strict separator error",
+		in:     []byte(`foo=bar;bar=baz`),
+		status: CookieScanError,
+		items: []CookieItem{
+			{Offset: 0, Raw: []byte(`foo=bar`), Name: []byte(`foo`), Value: []byte(`bar`)},
+			{Offset: 7, Raw: []byte(`;bar=baz`), Err: ErrCookieSeparator},
+		},
+		c: CookieScanner{
+			Strict: true,
+		},
+	},
+	{
+		label:  "lenient pairs without values",
+		in:     []byte(`foo;bar`),
+		status: CookieScanOK,
+		items: []CookieItem{
+			{Offset: 0, Raw: []byte(`foo`), Name: []byte(`foo`)},
+			{Offset: 4, Raw: []byte(`bar`), Name: []byte(`bar`)},
+		},
+	},
+	{
+		label:  "callback break",
+		in:     []byte(`a=1; b=2`),
+		status: CookieScanBreak,
+		items: []CookieItem{
+			{Offset: 0, Raw: []byte(`a=1`), Name: []byte(`a`), Value: []byte(`1`)},
+		},
+		brk: true,
+	},
+}
+
+func TestScanCookieItems(t *testing.T) {
+	for _, test := range cookieItemCases {
+		t.Run(test.label, func(t *testing.T) {
+			var act []CookieItem
+
+			status := test.c.ScanItems(test.in, func(item CookieItem) bool {
+				act = append(act, item)
+				return !test.brk
+			})
+			if status != test.status {
+				t.Errorf("unexpected status: %v; want %v", status, test.status)
+			}
+			if an, en := len(act), len(test.items); an != en {
+				t.Fatalf("unexpected number of items: %d; want %d", an, en)
+			}
+			for i, exp := range test.items {
+				av := act[i]
+				if av.Offset != exp.Offset ||
+					!bytes.Equal(av.Raw, exp.Raw) ||
+					!bytes.Equal(av.Name, exp.Name) ||
+					!bytes.Equal(av.Value, exp.Value) ||
+					av.Err != exp.Err {
+					t.Errorf(
+						"unexpected %d-th item: %+v; want %+v", i,
+						av, exp,
+					)
+				}
+			}
+			for i := 1; i < len(act); i++ {
+				prev, cur := act[i-1], act[i]
+				if prev.Offset+len(prev.Raw) > cur.Offset {
+					t.Errorf(
+						"items %d and %d report overlapping byte ranges: %+v and %+v",
+						i-1, i, prev, cur,
+					)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkScanCookie(b *testing.B) {
 	for _, test := range cookieCases {
 		b.Run(test.label, func(b *testing.B) {

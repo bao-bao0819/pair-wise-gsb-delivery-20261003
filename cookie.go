@@ -2,12 +2,19 @@ package httphead
 
 import (
 	"bytes"
+	"errors"
 )
 
 // ScanCookie scans cookie pairs from data using DefaultCookieScanner.Scan()
 // method.
 func ScanCookie(data []byte, it func(key, value []byte) bool) bool {
 	return DefaultCookieScanner.Scan(data, it)
+}
+
+// ScanCookieItems scans cookie items from data using
+// DefaultCookieScanner.ScanItems() method.
+func ScanCookieItems(data []byte, it func(CookieItem) bool) CookieScanStatus {
+	return DefaultCookieScanner.ScanItems(data, it)
 }
 
 // DefaultCookieScanner is a CookieScanner which is used by ScanCookie().
@@ -44,90 +51,165 @@ type CookieScanner struct {
 	Strict bool
 }
 
-// Scan maps data to name and value pairs. Usually data represents value of the
-// Cookie header.
-func (c CookieScanner) Scan(data []byte, it func(name, value []byte) bool) bool {
-	lexer := &Scanner{data: data}
+// CookieScanStatus describes the way cookie scanning has finished.
+type CookieScanStatus int
 
-	const (
-		statePair = iota
-		stateBefore
-	)
+const (
+	// CookieScanOK reports that the whole input has been scanned.
+	CookieScanOK CookieScanStatus = iota
 
-	state := statePair
+	// CookieScanError reports that scanning has stopped due to a pair
+	// syntax or validation error. It could happen only when
+	// CookieScanner.BreakOnPairError is set or when CookieScanner.Strict
+	// is set and the input violates the RFC6265 pairs separator rule.
+	CookieScanError
 
-	for lexer.Buffered() > 0 {
-		switch state {
-		case stateBefore:
-			// Pairs separated by ";" and space, according to the RFC6265:
-			//   cookie-pair *( ";" SP cookie-pair )
-			//
-			// Cookie pairs MUST be separated by (";" SP). So our only option
-			// here is to fail as syntax error.
-			a, b := lexer.Peek2()
-			if a != ';' {
-				return false
+	// CookieScanBreak reports that scanning has stopped because the items
+	// callback has returned false.
+	CookieScanBreak
+)
+
+var (
+	// ErrCookieNoValue reports that a cookie pair has no "=" and thus no
+	// value. It is reported only in strict mode; otherwise such pair is
+	// treated as a pair with empty value.
+	ErrCookieNoValue = errors.New("httphead: cookie pair has no value")
+
+	// ErrCookieInvalidName reports that a cookie pair has invalid name.
+	ErrCookieInvalidName = errors.New("httphead: invalid cookie name")
+
+	// ErrCookieInvalidValue reports that a cookie pair has invalid value.
+	ErrCookieInvalidValue = errors.New("httphead: invalid cookie value")
+
+	// ErrCookieUnclosedQuote reports that a cookie value has unclosed
+	// quote.
+	ErrCookieUnclosedQuote = errors.New("httphead: unclosed cookie value quote")
+
+	// ErrCookieSeparator reports that cookie pairs are not separated
+	// according to the RFC6265 ";" SP rule. It is reported only in strict
+	// mode.
+	ErrCookieSeparator = errors.New("httphead: invalid cookie pairs separator")
+)
+
+// CookieItem represents a single scanned cookie item — either a valid
+// name-value pair or a dropped fragment of the input.
+type CookieItem struct {
+	// Offset is the offset of the item within the scanned input.
+	Offset int
+
+	// Raw contains raw bytes of the item as they appeared in the input,
+	// excluding the ";" separator.
+	Raw []byte
+
+	// Name and Value contain parsed cookie pair bytes. They are nil when
+	// Err is non-nil.
+	Name  []byte
+	Value []byte
+
+	// Err describes the reason why the item was dropped. It is nil for
+	// valid cookie pairs.
+	Err error
+}
+
+// ScanItems maps data to cookie items, calling it for every scanned item —
+// both valid pairs and dropped fragments. Usually data represents value of
+// the Cookie header.
+//
+// The input is split into items by ";" separators, so a dropped item always
+// covers the whole fragment between two separators, even if it contains "="
+// bytes. Every item is reported to the callback exactly once and the
+// reported Raw byte ranges never overlap.
+//
+// If an item can not be parsed or validated, it is reported with non-nil Err
+// and scanning goes on, unless BreakOnPairError option is set — in that case
+// scanning stops and CookieScanError is returned. In strict mode a separator
+// that does not follow the RFC6265 ";" SP rule also stops scanning with
+// CookieScanError.
+//
+// If the callback returns false, scanning stops and CookieScanBreak is
+// returned.
+func (c CookieScanner) ScanItems(data []byte, it func(CookieItem) bool) CookieScanStatus {
+	for pos := 0; pos < len(data); {
+		end := len(data)
+		if i := bytes.IndexByte(data[pos:], ';'); i != -1 {
+			end = pos + i
+		}
+
+		item := c.scanPair(data[pos:end])
+		item.Offset = pos
+		item.Raw = data[pos:end]
+		if !it(item) {
+			return CookieScanBreak
+		}
+		if item.Err != nil && c.BreakOnPairError {
+			return CookieScanError
+		}
+
+		sep := end
+		pos = end + 1 // Skip ';'.
+		if pos < len(data) && data[pos] == ' ' {
+			pos++
+		} else if c.Strict && sep < len(data) {
+			// RFC6265 requires cookie pairs to be separated by ";" SP.
+			// Thus ";" followed by any other byte or by the end of data
+			// is a syntax error.
+			if !it(CookieItem{
+				Offset: sep,
+				Raw:    data[sep:],
+				Err:    ErrCookieSeparator,
+			}) {
+				return CookieScanBreak
 			}
-
-			state = statePair
-
-			advance := 1
-			if b == ' ' {
-				advance++
-			} else if c.Strict {
-				return false
-			}
-
-			lexer.Advance(advance)
-
-		case statePair:
-			if !lexer.FetchUntil(';') {
-				return false
-			}
-
-			var value []byte
-			name := lexer.Bytes()
-			if i := bytes.IndexByte(name, '='); i != -1 {
-				value = name[i+1:]
-				name = name[:i]
-			} else if c.Strict {
-				if !c.BreakOnPairError {
-					goto nextPair
-				}
-				return false
-			}
-
-			if !c.Strict {
-				trimLeft(name)
-			}
-			if !c.DisableNameValidation && !ValidCookieName(name) {
-				if !c.BreakOnPairError {
-					goto nextPair
-				}
-				return false
-			}
-
-			if !c.Strict {
-				value = trimRight(value)
-			}
-			value = stripQuotes(value)
-			if !c.DisableValueValidation && !ValidCookieValue(value, c.Strict) {
-				if !c.BreakOnPairError {
-					goto nextPair
-				}
-				return false
-			}
-
-			if !it(name, value) {
-				return true
-			}
-
-		nextPair:
-			state = stateBefore
+			return CookieScanError
 		}
 	}
+	return CookieScanOK
+}
 
-	return true
+// Scan maps data to name and value pairs. Usually data represents value of the
+// Cookie header.
+//
+// It reports only valid cookie pairs, silently skipping dropped items. To
+// inspect dropped items use ScanItems().
+func (c CookieScanner) Scan(data []byte, it func(name, value []byte) bool) bool {
+	return c.ScanItems(data, func(item CookieItem) bool {
+		if item.Err != nil {
+			return true
+		}
+		return it(item.Name, item.Value)
+	}) != CookieScanError
+}
+
+func (c CookieScanner) scanPair(pair []byte) (item CookieItem) {
+	name := pair
+	var value []byte
+	if i := bytes.IndexByte(pair, '='); i != -1 {
+		name, value = pair[:i], pair[i+1:]
+	} else if c.Strict {
+		item.Err = ErrCookieNoValue
+		return item
+	}
+
+	if !c.DisableNameValidation && !ValidCookieName(name) {
+		item.Err = ErrCookieInvalidName
+		return item
+	}
+
+	if !c.Strict {
+		value = trimRight(value)
+	}
+	value = stripQuotes(value)
+	if !c.DisableValueValidation && !ValidCookieValue(value, c.Strict) {
+		item.Err = ErrCookieInvalidValue
+		if n := len(value); n > 0 && value[0] == '"' && (n == 1 || value[n-1] != '"') {
+			item.Err = ErrCookieUnclosedQuote
+		}
+		return item
+	}
+
+	item.Name = name
+	item.Value = value
+	return item
 }
 
 // ValidCookieValue reports whether given value is a valid RFC6265
@@ -181,14 +263,6 @@ func stripQuotes(bts []byte) []byte {
 		return bts[1:last]
 	}
 	return bts
-}
-
-func trimLeft(p []byte) []byte {
-	var i int
-	for i < len(p) && OctetTypes[p[i]].IsSpace() {
-		i++
-	}
-	return p[i:]
 }
 
 func trimRight(p []byte) []byte {
