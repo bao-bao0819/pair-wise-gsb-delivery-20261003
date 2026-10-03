@@ -386,6 +386,19 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 			// Append and continue
 			p.AppendChild(child)
 		}
+
+		// A constructed BIT STRING is a segmented encoding of a single bit
+		// string: flatten the segments (recursively, in order) into the
+		// structured value. The children are kept so Bytes() re-encodes the
+		// packet unchanged.
+		if p.ClassType == ClassUniversal && p.Tag == TagBitString {
+			value, err := parseConstructedBitString(p)
+			if err != nil {
+				return nil, read, err
+			}
+			p.Value = value
+		}
+
 		return p, read, nil
 	}
 
@@ -424,6 +437,7 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 		case TagInteger:
 			p.Value, err = ParseInt64(content)
 		case TagBitString:
+			p.Value, err = ParseBitString(content)
 		case TagOctetString:
 			// the actual string encoding is not known here
 			// (e.g. for LDAP content is already an UTF8-encoded
