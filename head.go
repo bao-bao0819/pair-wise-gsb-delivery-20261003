@@ -3,7 +3,197 @@ package httphead
 import (
 	"bufio"
 	"bytes"
+	"errors"
 )
+
+// HeaderField represents a single HTTP header field as a name-value pair.
+type HeaderField struct {
+	Name  []byte
+	Value []byte
+}
+
+// ReadHeaderOptions configures ReadHeader behavior.
+//
+// The zero value means no limits and strict line ending policy.
+type ReadHeaderOptions struct {
+	// MaxLineLength limits the length of a single header line in bytes,
+	// including the terminating CRLF. Zero means no limit.
+	MaxLineLength int
+
+	// MaxFields limits the number of header fields. Zero means no limit.
+	MaxFields int
+
+	// MaxBytes limits the cumulative number of bytes read for the whole
+	// header block, including the terminating empty line. Zero means no
+	// limit.
+	MaxBytes int
+
+	// AllowBareLF allows header lines to be terminated by a bare '\n'
+	// without a preceding '\r'. By default such lines are rejected with
+	// ErrBareLineFeed.
+	AllowBareLF bool
+
+	// AllowObsFold allows obsolete line folding: a line starting with a
+	// space or horizontal tab is treated as a continuation of the previous
+	// field value. By default such lines are rejected with ErrObsFold.
+	AllowObsFold bool
+}
+
+var (
+	// ErrHeaderLineTooLong is returned by ReadHeader when a single header
+	// line exceeds ReadHeaderOptions.MaxLineLength.
+	ErrHeaderLineTooLong = errors.New("httphead: header line exceeds length limit")
+
+	// ErrTooManyHeaderFields is returned by ReadHeader when the number of
+	// header fields exceeds ReadHeaderOptions.MaxFields.
+	ErrTooManyHeaderFields = errors.New("httphead: header fields count exceeds limit")
+
+	// ErrHeaderTooLarge is returned by ReadHeader when the cumulative size
+	// of the header block exceeds ReadHeaderOptions.MaxBytes.
+	ErrHeaderTooLarge = errors.New("httphead: header block exceeds size limit")
+
+	// ErrBareLineFeed is returned by ReadHeader when a header line is
+	// terminated by a bare '\n' and ReadHeaderOptions.AllowBareLF is not
+	// set.
+	ErrBareLineFeed = errors.New("httphead: bare line feed in header")
+
+	// ErrObsFold is returned by ReadHeader when a line starts with a space
+	// or horizontal tab (obsolete line folding) and
+	// ReadHeaderOptions.AllowObsFold is not set.
+	ErrObsFold = errors.New("httphead: obsolete line folding in header")
+
+	// ErrMalformedHeaderLine is returned by ReadHeader when a header line
+	// can not be parsed as a key-value pair.
+	ErrMalformedHeaderLine = errors.New("httphead: malformed header line")
+)
+
+// ReadHeader reads a complete HTTP header block from br.
+//
+// The header block is a sequence of header field lines terminated by a
+// single empty line, which is the only normal end of the block. It returns
+// the parsed fields in the order they appear on the wire and the number of
+// bytes consumed from br. The consumed count is the offset at which the
+// message body starts.
+//
+// Duplicate fields are preserved in their original order; no comma-based
+// merging of values is performed at this layer.
+//
+// Lines must be terminated by CRLF. Bare line feeds and obsolete line
+// folding are rejected unless explicitly allowed by the corresponding
+// ReadHeaderOptions flags.
+//
+// If a limit is exceeded or the stream is truncated before the terminating
+// empty line, ReadHeader reports the error along with the number of bytes
+// consumed so far and stops reading immediately. That is, it never keeps
+// reading bytes that may belong to a subsequent request. On error the
+// returned fields contain the fields parsed so far.
+//
+// The returned fields are copied out of the reader's buffer, so they stay
+// valid after subsequent reads from br.
+func ReadHeader(br *bufio.Reader, opts ReadHeaderOptions) (fields []HeaderField, n int, err error) {
+	for {
+		var maxTotal int
+		if opts.MaxBytes > 0 {
+			maxTotal = opts.MaxBytes - n
+			if maxTotal <= 0 {
+				return fields, n, ErrHeaderTooLarge
+			}
+		}
+
+		line, crlf, m, lerr := readHeaderLine(br, opts.MaxLineLength, maxTotal)
+		n += m
+		if lerr != nil {
+			return fields, n, lerr
+		}
+		if !crlf && !opts.AllowBareLF {
+			return fields, n, ErrBareLineFeed
+		}
+		if len(line) == 0 {
+			// Empty line is the only normal end of the header block.
+			return fields, n, nil
+		}
+		if c := line[0]; c == ' ' || c == '\t' {
+			if !opts.AllowObsFold {
+				return fields, n, ErrObsFold
+			}
+			if len(fields) == 0 {
+				return fields, n, ErrMalformedHeaderLine
+			}
+			// Unfold by joining the continuation with the previous
+			// value using a single space. Copy into a fresh slice to
+			// not write into the bufio.Reader internal buffer.
+			last := &fields[len(fields)-1]
+			cont := trim(line)
+			v := make([]byte, 0, len(last.Value)+1+len(cont))
+			v = append(v, last.Value...)
+			if len(last.Value) > 0 && len(cont) > 0 {
+				v = append(v, ' ')
+			}
+			last.Value = append(v, cont...)
+			continue
+		}
+
+		k, v, ok := ParseHeaderLine(line)
+		if !ok {
+			return fields, n, ErrMalformedHeaderLine
+		}
+		// Copy the field out of the reader's buffer: it must stay
+		// valid after further reads from br.
+		fields = append(fields, HeaderField{
+			Name:  append([]byte(nil), k...),
+			Value: append([]byte(nil), v...),
+		})
+		if opts.MaxFields > 0 && len(fields) > opts.MaxFields {
+			return fields, n, ErrTooManyHeaderFields
+		}
+	}
+}
+
+// readHeaderLine reads a single line from br much like ReadLine, but
+// additionally enforces the given limits and reports the line ending style.
+//
+// It returns the line without the trailing CRLF or LF, whether the line was
+// terminated by CRLF, and the number of bytes consumed from br, including
+// the terminator.
+//
+// maxLine limits the number of bytes consumed by this call; maxTotal limits
+// it as well, but violations are reported as ErrHeaderTooLarge instead of
+// ErrHeaderLineTooLong. Zero means no limit. When a limit is exceeded the
+// function returns immediately without reading the rest of the line.
+func readHeaderLine(br *bufio.Reader, maxLine, maxTotal int) (line []byte, crlf bool, n int, err error) {
+	for {
+		bts, rerr := br.ReadSlice('\n')
+		n += len(bts)
+		if maxLine > 0 && n > maxLine {
+			return nil, false, n, ErrHeaderLineTooLong
+		}
+		if maxTotal > 0 && n > maxTotal {
+			return nil, false, n, ErrHeaderTooLarge
+		}
+		if rerr == bufio.ErrBufferFull {
+			// Copy bytes because next read will discard them.
+			line = append(line, bts...)
+			continue
+		}
+		// Avoid copy of single read.
+		if line == nil {
+			line = bts
+		} else {
+			line = append(line, bts...)
+		}
+		if rerr != nil {
+			// Truncated stream: report consumed bytes and stop.
+			return nil, false, n, rerr
+		}
+		// Size of line is at least 1.
+		// In other case bufio.ReadSlice() returns error.
+		m := len(line)
+		if m > 1 && line[m-2] == '\r' {
+			return line[:m-2], true, n, nil
+		}
+		return line[:m-1], false, n, nil
+	}
+}
 
 // Version contains protocol major and minor version.
 type Version struct {
