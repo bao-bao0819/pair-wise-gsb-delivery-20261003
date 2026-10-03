@@ -3,6 +3,8 @@ package httphead
 import (
 	"bufio"
 	"bytes"
+	"errors"
+	"io"
 )
 
 // Version contains protocol major and minor version.
@@ -172,6 +174,119 @@ func ReadLine(br *bufio.Reader) ([]byte, error) {
 			line = line[:n-1]
 		}
 		return line, nil
+	}
+}
+
+// Header contains single HTTP header field as a name-value pair.
+type Header struct {
+	Name  []byte
+	Value []byte
+}
+
+// HeaderLimits contains limits for ReadHeader.
+//
+// Non-positive value of any limit means that this limit is not applied.
+type HeaderLimits struct {
+	// MaxLineLength limits length of a single header line in bytes,
+	// including the terminating CRLF sequence.
+	MaxLineLength int
+
+	// MaxFields limits number of header fields in the block.
+	MaxFields int
+
+	// MaxBytes limits total number of bytes in the whole header block,
+	// including the terminating empty line.
+	MaxBytes int
+}
+
+var (
+	// ErrHeaderLineTooLong is returned by ReadHeader when a single header
+	// line exceeds HeaderLimits.MaxLineLength.
+	ErrHeaderLineTooLong = errors.New("httphead: header line is too long")
+
+	// ErrTooManyHeaders is returned by ReadHeader when the number of header
+	// fields exceeds HeaderLimits.MaxFields.
+	ErrTooManyHeaders = errors.New("httphead: too many header fields")
+
+	// ErrHeaderTooLarge is returned by ReadHeader when the whole header
+	// block exceeds HeaderLimits.MaxBytes.
+	ErrHeaderTooLarge = errors.New("httphead: header block is too large")
+
+	// ErrBareLineFeed is returned by ReadHeader when a line is terminated
+	// by a bare LF without preceding CR.
+	ErrBareLineFeed = errors.New("httphead: bare line feed in header block")
+
+	// ErrObsoleteFolding is returned by ReadHeader when a line starts with
+	// SP or HT, that is, when obsolete line folding is met.
+	ErrObsoleteFolding = errors.New("httphead: obsolete line folding in header block")
+
+	// ErrMalformedHeader is returned by ReadHeader when a header line can
+	// not be parsed as a key-value pair.
+	ErrMalformedHeader = errors.New("httphead: malformed header line")
+)
+
+// ReadHeader reads a complete header block from br and returns the list of
+// header fields in the order they appear in the block, along with the number
+// of bytes consumed from br. On success n is the offset at which the message
+// body (or the next header block) starts.
+//
+// Duplicate fields are preserved in their original order; no comma-based
+// merging is performed at this layer.
+//
+// The block is terminated by an empty line, which is the only valid end of
+// the block. Lines must be terminated by CRLF: a bare LF is rejected with
+// ErrBareLineFeed. Obsolete line folding (a line starting with SP or HT) is
+// rejected with ErrObsoleteFolding.
+//
+// If any limit from lim is exceeded, or the block is truncated (EOF before
+// the terminating empty line, reported as io.ErrUnexpectedEOF), ReadHeader
+// returns an error, the fields parsed so far and the number of bytes
+// consumed so far. It does not read beyond that point, so the rest of the
+// stream (e.g. a subsequent request) is left untouched in br.
+//
+// The returned fields reference memory owned by ReadHeader and are safe to
+// retain after subsequent I/O operations on br.
+func ReadHeader(br *bufio.Reader, lim HeaderLimits) (fields []Header, n int, err error) {
+	for {
+		var line []byte
+		for {
+			bts, rerr := br.ReadSlice('\n')
+			n += len(bts)
+			if lim.MaxBytes > 0 && n > lim.MaxBytes {
+				return fields, n, ErrHeaderTooLarge
+			}
+			line = append(line, bts...)
+			if lim.MaxLineLength > 0 && len(line) > lim.MaxLineLength {
+				return fields, n, ErrHeaderLineTooLong
+			}
+			if rerr == bufio.ErrBufferFull {
+				continue
+			}
+			if rerr != nil {
+				return fields, n, io.ErrUnexpectedEOF
+			}
+			break
+		}
+		// The line is guaranteed to end with '\n'.
+		if m := len(line); m < 2 || line[m-2] != '\r' {
+			return fields, n, ErrBareLineFeed
+		}
+		line = line[:len(line)-2]
+		if len(line) == 0 {
+			// Empty line is the only valid end of the header block.
+			return fields, n, nil
+		}
+		if c := line[0]; c == ' ' || c == '\t' {
+			return fields, n, ErrObsoleteFolding
+		}
+		k, v, ok := ParseHeaderLine(line)
+		if !ok {
+			return fields, n, ErrMalformedHeader
+		}
+		fields = append(fields, Header{Name: k, Value: v})
+		if lim.MaxFields > 0 && len(fields) > lim.MaxFields {
+			return fields, n, ErrTooManyHeaders
+		}
 	}
 }
 
