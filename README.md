@@ -89,9 +89,21 @@ s := secure.New(secure.Options{
     XDNSPrefetchControl: "on", // XDNSPrefetchControl allows the X-DNS-Prefetch-Control header to be set via "on" or "off" keyword. Default is "".
     XPermittedCrossDomainPolicies: "none", // XPermittedCrossDomainPolicies allows the X-Permitted-Cross-Domain-Policies to be set with a custom value. Default is "".
     IsDevelopment: true, // This will cause the AllowedHosts, SSLRedirect, and STSSeconds/STSIncludeSubdomains options to be ignored during development. When deploying to production, be sure to set this to false.
+    HeadersCommitMode: true, // If HeadersCommitMode is set to true, the security headers are applied just before the final response headers are committed to the client, instead of before the downstream handler runs. Default is false.
+    DefaultHeaderConflictBehavior: secure.HeaderConflictOverride, // DefaultHeaderConflictBehavior is the behavior used in commit mode for headers without an entry in HeaderConflictBehaviors. Default is HeaderConflictOverride.
+    HeaderConflictBehaviors: map[string]secure.HeaderConflictBehavior{"X-Frame-Options": secure.HeaderConflictKeep}, // HeaderConflictBehaviors maps canonical header names to the behavior used in commit mode when a downstream handler has already set that header. Default is nil.
+    CommitErrorHandler: nil, // CommitErrorHandler is called when applying the security headers at commit time fails. If nil, a 500 error is written. Default is nil.
 })
 // ...
 ~~~
+
+### Headers commit mode
+By default the security headers are written to the response before the downstream handler runs, so a handler can silently change or remove them. With `HeadersCommitMode` set to `true`, the headers are instead applied just before the final response headers are committed to the client (on the first `WriteHeader`, `Write`, or `Flush`). Informational 1xx statuses pass through without committing, and the optional `http.Flusher`, `http.Hijacker`, and `http.Pusher` interfaces are only exposed when the underlying `http.ResponseWriter` supports them.
+
+When a downstream handler has already set a security header, the conflict is resolved per header via `HeaderConflictBehaviors` (falling back to `DefaultHeaderConflictBehavior`):
+- `secure.HeaderConflictOverride`: the middleware value replaces the downstream value (default).
+- `secure.HeaderConflictKeep`: the downstream value is kept.
+- `secure.HeaderConflictError`: the conflict is reported to `CommitErrorHandler` (or a default 500 response) via a `*secure.CommitConflictError`.
 
 ### Default options
 These are the preset options for Secure:

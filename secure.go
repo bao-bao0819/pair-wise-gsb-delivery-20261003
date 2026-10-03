@@ -70,6 +70,11 @@ type Options struct {
 	SSLForceHost bool
 	// If SSLTemporaryRedirect is true, then a 307 will be used while redirecting. Default is false (301).
 	SSLTemporaryRedirect bool
+	// If HeadersCommitMode is true, the security headers are not written up front. Instead they are applied just
+	// before the final response headers are committed to the client, so values set by downstream handlers can no
+	// longer silently change the outcome. Conflicts are resolved per header according to HeaderConflictBehaviors
+	// and DefaultHeaderConflictBehavior. Default is false.
+	HeadersCommitMode bool
 	// If STSIncludeSubdomains is set to true, the `includeSubdomains` will be appended to the Strict-Transport-Security header. Default is false.
 	STSIncludeSubdomains bool
 	// If STSPreload is set to true, the `preload` flag will be appended to the Strict-Transport-Security header. Default is false.
@@ -114,6 +119,16 @@ type Options struct {
 	AllowedHostsAreRegex bool
 	// AllowRequestFunc is a custom function that allows you to determine if the request should proceed or not based on your own custom logic. Default is nil.
 	AllowRequestFunc AllowRequestFunc `json:"-" toml:"-" yaml:"-"`
+	// CommitErrorHandler is called when applying the security headers at commit time fails, e.g. when a header
+	// configured with HeaderConflictError conflicts with a downstream value. Only used when HeadersCommitMode is
+	// true. If nil, a 500 error is written. Default is nil.
+	CommitErrorHandler func(w http.ResponseWriter, err error) `json:"-" toml:"-" yaml:"-"`
+	// DefaultHeaderConflictBehavior is the behavior used in commit mode for headers without an entry in
+	// HeaderConflictBehaviors. Default is HeaderConflictOverride.
+	DefaultHeaderConflictBehavior HeaderConflictBehavior
+	// HeaderConflictBehaviors maps canonical header names to the behavior used in commit mode when a downstream
+	// handler has already set that header. Only used when HeadersCommitMode is true. Default is nil.
+	HeaderConflictBehaviors map[string]HeaderConflictBehavior
 	// HostsProxyHeaders is a set of header keys that may hold a proxied hostname value for the request.
 	HostsProxyHeaders []string
 	// SSLHostFunc is a function pointer, the return value of the function is the host name that has same functionality as `SSHost`. Default is nil.
@@ -203,12 +218,21 @@ func (s *Secure) Handler(h http.Handler) http.Handler {
 		// Let secure process the request. If it returns an error,
 		// that indicates the request should not continue.
 		responseHeader, r, err := s.processRequest(w, r)
-		addResponseHeaders(responseHeader, w)
 
 		// If there was an error, do not continue.
 		if err != nil {
 			return
 		}
+
+		// In commit mode the headers are applied right before the response
+		// headers are written out, downstream of any handler modifications.
+		if s.opt.HeadersCommitMode {
+			h.ServeHTTP(s.wrapCommitResponseWriter(w, responseHeader), r)
+
+			return
+		}
+
+		addResponseHeaders(responseHeader, w)
 
 		h.ServeHTTP(w, r)
 	})
