@@ -1,9 +1,11 @@
 package workerpool
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -665,6 +667,138 @@ func TestPanicDo(t *testing.T) {
 		t.Fatal("task function should not have called")
 	default:
 	}
+}
+
+func TestPanicHandler(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var wp *WorkerPool
+		var mu sync.Mutex
+		var panics []any
+		var stacks [][]byte
+		wp = New(1, WithPanicHandler(func(panicValue any, stack []byte) {
+			// The handler must be able to query pool state; it is called
+			// without holding any internal pool lock.
+			_ = wp.WaitingQueueSize()
+			_ = wp.Stopped()
+			mu.Lock()
+			panics = append(panics, panicValue)
+			stacks = append(stacks, stack)
+			mu.Unlock()
+		}))
+
+		// A single worker must keep taking tasks after consecutive panics.
+		for i := range 3 {
+			wp.Submit(func() { panic(i) })
+		}
+		done := make(chan struct{})
+		wp.Submit(func() { close(done) })
+		wp.StopWait()
+
+		select {
+		case <-done:
+		default:
+			t.Fatal("worker did not run task after panicking tasks")
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(panics) != 3 {
+			t.Fatal("expected 3 handled panics, got", len(panics))
+		}
+		for i, v := range panics {
+			if v != i {
+				t.Fatal("wrong panic value at", i, ":", v)
+			}
+		}
+		for i, stack := range stacks {
+			if !bytes.Contains(stack, []byte("workerpool.runTask")) {
+				t.Fatal("stack", i, "missing panicking goroutine trace:", string(stack))
+			}
+		}
+	})
+}
+
+func TestPanicHandlerConcurrent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const workers = 5
+		var count atomic.Int32
+		wp := New(workers, WithPanicHandler(func(any, []byte) {
+			count.Add(1)
+		}))
+
+		// Make all workers panic at the same time.
+		started := make(chan struct{}, workers)
+		release := make(chan struct{})
+		for range workers {
+			wp.Submit(func() {
+				started <- struct{}{}
+				<-release
+				panic("boom")
+			})
+		}
+		for range workers {
+			<-started
+		}
+		close(release)
+
+		done := make(chan struct{})
+		wp.Submit(func() { close(done) })
+		wp.StopWait()
+
+		select {
+		case <-done:
+		default:
+			t.Fatal("pool did not run task after concurrent panics")
+		}
+		if int(count.Load()) != workers {
+			t.Fatal("expected", workers, "handled panics, got", count.Load())
+		}
+	})
+}
+
+func TestPanicHandlerStopWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const tasks = 10
+		var count atomic.Int32
+		wp := New(2, WithPanicHandler(func(any, []byte) {
+			count.Add(1)
+		}))
+
+		// Queue more panicking tasks than workers, so that some fail while
+		// being drained during StopWait.
+		for range tasks {
+			wp.Submit(func() { panic("boom") })
+		}
+		// Must not hang; a leaked worker count would deadlock here.
+		wp.StopWait()
+
+		if int(count.Load()) != tasks {
+			t.Fatal("expected", tasks, "handled panics, got", count.Load())
+		}
+	})
+}
+
+func TestPanicHandlerPanics(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1, WithPanicHandler(func(any, []byte) {
+			panic("handler boom")
+		}))
+
+		for range 3 {
+			wp.Submit(func() { panic("boom") })
+		}
+		done := make(chan struct{})
+		wp.Submit(func() { close(done) })
+		// A panicking handler must not kill the worker or leak the worker
+		// count; StopWait would deadlock here if it did.
+		wp.StopWait()
+
+		select {
+		case <-done:
+		default:
+			t.Fatal("worker did not survive panicking handler")
+		}
+	})
 }
 
 func assertPanics(t *testing.T, name string, f func()) {

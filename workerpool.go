@@ -3,6 +3,7 @@ package workerpool
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,7 +40,7 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 	}
 
 	// Start the task dispatcher.
-	go pool.dispatch(cfg.idleTimeout)
+	go pool.dispatch(cfg.idleTimeout, cfg.panicHandler)
 
 	return pool
 }
@@ -184,7 +185,7 @@ func (p *WorkerPool) Pause(ctx context.Context) {
 }
 
 // dispatch sends the next queued task to an available worker.
-func (p *WorkerPool) dispatch(idleTimeout time.Duration) {
+func (p *WorkerPool) dispatch(idleTimeout time.Duration, panicHandler func(any, []byte)) {
 	defer close(p.stoppedChan)
 	var idle bool
 	var idleTO <-chan time.Time
@@ -223,7 +224,7 @@ Loop:
 				// Create a new worker, if not at max.
 				if workerCount < p.maxWorkers {
 					wg.Add(1)
-					go worker(task, p.workerQueue, &wg)
+					go worker(task, p.workerQueue, &wg, panicHandler)
 					workerCount++
 				} else {
 					// Enqueue task to be executed by next available worker.
@@ -259,12 +260,38 @@ Loop:
 }
 
 // worker executes tasks and stops when it receives a nil task.
-func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
+func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup, panicHandler func(any, []byte)) {
+	// Done is deferred so that the worker count cannot leak if a task
+	// panics without a panic handler configured.
+	defer wg.Done()
 	for task != nil {
-		task()
+		runTask(task, panicHandler)
 		task = <-workerQueue
 	}
-	wg.Done()
+}
+
+// runTask executes a single task, recovering a task panic when a panic
+// handler is configured. Without a handler, a task panic propagates and
+// crashes the program, preserving the original semantics.
+func runTask(task func(), panicHandler func(any, []byte)) {
+	if panicHandler == nil {
+		task()
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			// Capture the stack while the panicking frames are still
+			// on the goroutine stack.
+			stack := debug.Stack()
+			// A panic in the handler itself is discarded so that the
+			// worker stays alive and shutdown accounting cannot leak.
+			defer func() {
+				_ = recover()
+			}()
+			panicHandler(r, stack)
+		}
+	}()
+	task()
 }
 
 // stop tells the dispatcher to exit, and whether or not to complete queued
