@@ -52,6 +52,20 @@ func (p *Parser) ParseBytes(b []byte) (*Value, error) {
 	return p.Parse(b2s(b))
 }
 
+// shrink prepares p for pooling under the given retention policy.
+//
+// It is invoked only by ParserPool.Put, so values previously parsed by p are
+// already invalid. The input buffer is released when it is larger than
+// MaxInputBytes; otherwise its capacity is kept.
+func (p *Parser) shrink(rp RetentionPolicy) {
+	p.c.shrink(rp)
+	if rp.MaxInputBytes > 0 && cap(p.b) > rp.MaxInputBytes {
+		p.b = nil
+	} else {
+		p.b = p.b[:0]
+	}
+}
+
 type cache struct {
 	vs []Value
 }
@@ -60,6 +74,34 @@ func (c *cache) reset() {
 	vs := c.vs
 	for i := range vs {
 		vs[i].reset()
+	}
+	c.vs = vs[:0]
+}
+
+// shrink resets the cache for re-use while enforcing the retention policy.
+//
+// The whole Value backing slice is released when it holds more values than
+// MaxValues. Otherwise each live cached Value has its over-sized array or
+// object backing storage released, so a single huge array/object cannot be
+// retained.
+//
+// It is called only when the owning Parser is returned to a ParserPool, at
+// which point all values are already invalid.
+func (c *cache) shrink(rp RetentionPolicy) {
+	vs := c.vs
+	if rp.MaxValues > 0 && cap(vs) > rp.MaxValues {
+		// Drop references held by the discarded slots before abandoning the
+		// backing array, so the GC can collect them.
+		clear(vs[:cap(vs)])
+		c.vs = nil
+		return
+	}
+	// Reset only the live slots. Slots hidden behind len(vs) may hold stale
+	// slice headers that alias this backing array (arrays/objects grow into
+	// neighboring Value slots), so writing through them is unsafe; reset()
+	// deliberately iterates len(vs) only for the same reason.
+	for i := range vs {
+		vs[i].shrink(rp)
 	}
 	c.vs = vs[:0]
 }
@@ -591,6 +633,30 @@ func (v *Value) reset() {
 
 	clear(v.a)
 	v.a = v.a[:0]
+
+	v.s = ""
+	v.t = 0
+}
+
+// shrink resets v for re-use but releases a single over-sized array or object
+// instead of retaining its backing storage. It enforces MaxArrayValues and
+// MaxObjectItems so one huge value cannot pin a large allocation.
+func (v *Value) shrink(rp RetentionPolicy) {
+	if rp.MaxObjectItems > 0 && cap(v.o.kvs) > rp.MaxObjectItems {
+		clear(v.o.kvs)
+		v.o.kvs = nil
+		v.o.keysUnescaped = false
+	} else {
+		v.o.reset()
+	}
+
+	if rp.MaxArrayValues > 0 && cap(v.a) > rp.MaxArrayValues {
+		clear(v.a)
+		v.a = nil
+	} else {
+		clear(v.a)
+		v.a = v.a[:0]
+	}
 
 	v.s = ""
 	v.t = 0

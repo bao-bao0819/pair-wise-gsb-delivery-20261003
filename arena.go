@@ -28,6 +28,20 @@ func (a *Arena) Reset() {
 	a.c.reset()
 }
 
+// shrink resets a for pooling while enforcing the retention policy.
+//
+// It is invoked only by ArenaPool.Put, so values allocated by a are already
+// invalid. The marshaling buffer is released when it is larger than
+// MaxInputBytes; otherwise its capacity is kept.
+func (a *Arena) shrink(rp RetentionPolicy) {
+	a.c.shrink(rp)
+	if rp.MaxInputBytes > 0 && cap(a.b) > rp.MaxInputBytes {
+		a.b = nil
+	} else {
+		a.b = a.b[:0]
+	}
+}
+
 // NewObject returns new empty object value.
 //
 // New entries may be added to the returned object via Set call.
