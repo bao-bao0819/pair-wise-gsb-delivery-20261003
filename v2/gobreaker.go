@@ -110,6 +110,10 @@ type CircuitBreaker[T any] struct {
 	counts     *rollingCounts
 	start      time.Time
 	expiry     time.Time
+
+	subscribers      map[uint64]*subscription
+	nextSubscriberID uint64
+	eventSeq         uint64
 }
 
 // NewCircuitBreaker returns a new CircuitBreaker configured with the given Settings.
@@ -167,6 +171,8 @@ func NewCircuitBreaker[T any](st Settings) *CircuitBreaker[T] {
 	}
 
 	cb.toNewGeneration(time.Now())
+
+	cb.subscribers = make(map[uint64]*subscription)
 
 	return cb
 }
@@ -338,11 +344,25 @@ func (cb *CircuitBreaker[T]) setState(state State, now time.Time) {
 	prev := cb.state
 	cb.state = state
 
+	// Snapshot the counters that led to the transition before they are
+	// reset for the new generation.
+	counts := cb.counts.Counts
+
 	cb.toNewGeneration(now)
 
 	if cb.onStateChange != nil {
 		cb.onStateChange(cb.name, prev, state)
 	}
+
+	cb.eventSeq++
+	cb.publish(StateChangeEvent{
+		Seq:       cb.eventSeq,
+		Name:      cb.name,
+		From:      prev,
+		To:        state,
+		Counts:    counts,
+		Timestamp: now,
+	})
 }
 
 func (cb *CircuitBreaker[T]) toNewGeneration(now time.Time) {
